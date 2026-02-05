@@ -1,0 +1,303 @@
+# GL Report Templates
+
+**Purpose:** Ready-to-use SQL skeletons for GL reporting.
+
+---
+
+## 1. Trial Balance (Simple)
+*List Account Balances for a specific period.*
+
+```sql
+/*
+TITLE: Simple Trial Balance
+PURPOSE: Verify G/L Account Balances
+*/
+
+WITH
+-- 1. Balances
+BAL AS (
+    SELECT /*+ qb_name(B) MATERIALIZE */
+           GB.CODE_COMBINATION_ID, SUM(GB.PERIOD_NET_DR) DR, SUM(GB.PERIOD_NET_CR) CR
+    FROM   GL_BALANCES GB
+    WHERE  GB.LEDGER_ID = :P_LEDGER_ID
+      AND  GB.PERIOD_NAME = :P_PERIOD
+      AND  GB.ACTUAL_FLAG = 'A'
+    GROUP BY GB.CODE_COMBINATION_ID
+),
+
+-- 2. Accounts
+ACCTS AS (
+    SELECT /*+ qb_name(A) MATERIALIZE */
+           GCC.CODE_COMBINATION_ID
+          ,GCC.SEGMENT1 AS COMPANY
+          ,GCC.SEGMENT2 AS ACCOUNT
+    FROM   GL_CODE_COMBINATIONS GCC
+)
+
+-- 3. Final Select
+SELECT A.COMPANY
+      ,A.ACCOUNT
+      ,B.DR
+      ,B.CR
+      ,(B.DR - B.CR) AS NET_ACTIVITY
+FROM   BAL B
+      ,ACCTS A
+WHERE  B.CODE_COMBINATION_ID = A.CODE_COMBINATION_ID
+ORDER BY A.COMPANY, A.ACCOUNT
+```
+
+---
+
+## 2. GL Journal Voucher (Detailed Print)
+*Complete journal voucher with batch details for printing.*
+
+```sql
+/*
+TITLE: GL Journal Voucher Print
+PURPOSE: Detailed journal voucher with batch and user information
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Journal Entry Details
+JE_DATA AS (
+    SELECT /*+ qb_name(JE_DATA) MATERIALIZE */
+           -- Batch Details
+           GJB.NAME BATCH_NAME
+          ,GJB.DEFAULT_PERIOD_NAME BATCH_PERIOD
+          ,GJB.DESCRIPTION BATCH_DESCRIPTION
+          -- Header Details
+          ,GJH.NAME JE_NAME
+          ,GJH.PERIOD_NAME
+          ,GJH.DEFAULT_EFFECTIVE_DATE EFFECTIVE_DATE
+          ,GJH.JE_SOURCE
+          ,GJH.JE_CATEGORY
+          ,GJH.CURRENCY_CODE
+          ,GJH.POSTED_DATE
+          ,GJH.DOC_SEQUENCE_VALUE VOUCHER_NUMBER
+          ,GJH.DESCRIPTION JE_DESCRIPTION
+          -- Line Details
+          ,GJL.JE_LINE_NUM
+          ,GCCK.CONCATENATED_SEGMENTS ACCOUNT_STRING
+          ,GCCK.DESCRIPTION ACCOUNT_DESCRIPTION
+          ,GJL.ENTERED_DR
+          ,GJL.ENTERED_CR
+          ,GJL.ACCOUNTED_DR
+          ,GJL.ACCOUNTED_CR
+          ,GJL.DESCRIPTION LINE_DESCRIPTION
+          -- Ledger Details
+          ,GLL.NAME LEDGER_NAME
+          ,XLE.NAME LEGAL_ENTITY_NAME
+          -- User Details
+          ,FU.USER_NAME CREATED_BY
+          ,GJH.CREATION_DATE
+          -- Row Number for Total Calculation
+          ,ROW_NUMBER() OVER (PARTITION BY GJH.JE_HEADER_ID ORDER BY GJL.JE_LINE_NUM) RN
+          ,COUNT(*) OVER (PARTITION BY GJH.JE_HEADER_ID) TOTAL_LINES
+          -- Running Total
+          ,SUM(NVL(GJL.ACCOUNTED_DR, 0)) OVER (PARTITION BY GJH.JE_HEADER_ID ORDER BY GJL.JE_LINE_NUM) RUNNING_DR
+          ,SUM(NVL(GJL.ACCOUNTED_CR, 0)) OVER (PARTITION BY GJH.JE_HEADER_ID ORDER BY GJL.JE_LINE_NUM) RUNNING_CR
+    FROM   GL_JE_BATCHES GJB
+          ,GL_JE_HEADERS GJH
+          ,GL_JE_LINES GJL
+          ,GL_CODE_COMBINATIONS_KFV GCCK
+          ,GL_LEDGERS GLL
+          ,GL_LEDGER_LE_V GLLV
+          ,XLE_ENTITY_PROFILES XLE
+          ,FND_USER FU
+    WHERE  GJB.JE_BATCH_ID = GJH.JE_BATCH_ID
+      AND  GJH.JE_HEADER_ID = GJL.JE_HEADER_ID
+      AND  GJL.CODE_COMBINATION_ID = GCCK.CODE_COMBINATION_ID
+      AND  GJH.LEDGER_ID = GLL.LEDGER_ID
+      AND  GLL.LEDGER_ID = GLLV.LEDGER_ID
+      AND  GLLV.LEGAL_ENTITY_ID = XLE.LEGAL_ENTITY_ID
+      AND  GJH.CREATED_BY = FU.USER_ID(+)
+      AND  GJH.STATUS = 'P'
+      AND  GJH.LEDGER_ID = :P_LEDGER_ID
+      AND  GJH.JE_HEADER_ID = :P_JE_HEADER_ID
+)
+SELECT * FROM JE_DATA
+ORDER BY JE_LINE_NUM
+```
+
+---
+
+## 3. GL Register Report (Comprehensive Journal Register)
+*Complete journal register with all transactions for a period.*
+
+```sql
+/*
+TITLE: GL Journal Register Report
+PURPOSE: Comprehensive register of all posted journals for a period
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Journal Summary
+JE_SUMMARY AS (
+    SELECT /*+ qb_name(JE_SUM) MATERIALIZE */
+           GJH.JE_HEADER_ID
+          ,GJH.NAME JE_NAME
+          ,GJH.PERIOD_NAME
+          ,GJH.DEFAULT_EFFECTIVE_DATE EFFECTIVE_DATE
+          ,GJH.JE_SOURCE
+          ,GJH.JE_CATEGORY
+          ,GJH.CURRENCY_CODE
+          ,GJH.POSTED_DATE
+          ,GJH.DOC_SEQUENCE_VALUE VOUCHER_NUMBER
+          ,GJH.DESCRIPTION JE_DESCRIPTION
+          ,GLL.NAME LEDGER_NAME
+          ,XLE.NAME LEGAL_ENTITY_NAME
+          ,FU.USER_NAME CREATED_BY
+          ,GJH.CREATION_DATE
+          -- Totals
+          ,SUM(NVL(GJL.ACCOUNTED_DR, 0)) TOTAL_DR
+          ,SUM(NVL(GJL.ACCOUNTED_CR, 0)) TOTAL_CR
+          ,COUNT(*) LINE_COUNT
+    FROM   GL_JE_HEADERS GJH
+          ,GL_JE_LINES GJL
+          ,GL_LEDGERS GLL
+          ,GL_LEDGER_LE_V GLLV
+          ,XLE_ENTITY_PROFILES XLE
+          ,FND_USER FU
+    WHERE  GJH.JE_HEADER_ID = GJL.JE_HEADER_ID
+      AND  GJH.LEDGER_ID = GLL.LEDGER_ID
+      AND  GLL.LEDGER_ID = GLLV.LEDGER_ID
+      AND  GLLV.LEGAL_ENTITY_ID = XLE.LEGAL_ENTITY_ID
+      AND  GJH.CREATED_BY = FU.USER_ID(+)
+      AND  GJH.STATUS = 'P'
+      AND  GJH.LEDGER_ID = :P_LEDGER_ID
+      AND  GJH.PERIOD_NAME = :P_PERIOD
+      AND  TRUNC(GJH.POSTED_DATE) BETWEEN NVL(:P_FROM_DATE, TRUNC(GJH.POSTED_DATE))
+                                      AND NVL(:P_TO_DATE, TRUNC(GJH.POSTED_DATE))
+    GROUP BY GJH.JE_HEADER_ID, GJH.NAME, GJH.PERIOD_NAME, GJH.DEFAULT_EFFECTIVE_DATE,
+             GJH.JE_SOURCE, GJH.JE_CATEGORY, GJH.CURRENCY_CODE, GJH.POSTED_DATE,
+             GJH.DOC_SEQUENCE_VALUE, GJH.DESCRIPTION, GLL.NAME, XLE.NAME,
+             FU.USER_NAME, GJH.CREATION_DATE
+),
+-- Journal Line Details
+JE_LINES AS (
+    SELECT /*+ qb_name(JE_LN) */
+           GJL.JE_HEADER_ID
+          ,GJL.JE_LINE_NUM
+          ,GCCK.CONCATENATED_SEGMENTS ACCOUNT_STRING
+          ,GCCK.SEGMENT1 COMPANY
+          ,GCCK.SEGMENT2 ACCOUNT
+          ,GCCK.SEGMENT3 COST_CENTER
+          ,GCCK.SEGMENT4 NATURAL_ACCOUNT
+          ,GCCK.DESCRIPTION ACCOUNT_DESCRIPTION
+          ,GJL.ENTERED_DR
+          ,GJL.ENTERED_CR
+          ,GJL.ACCOUNTED_DR
+          ,GJL.ACCOUNTED_CR
+          ,GJL.DESCRIPTION LINE_DESCRIPTION
+    FROM   GL_JE_LINES GJL
+          ,GL_CODE_COMBINATIONS_KFV GCCK
+    WHERE  GJL.CODE_COMBINATION_ID = GCCK.CODE_COMBINATION_ID
+)
+-- Final Selection
+SELECT JS.LEDGER_NAME
+      ,JS.LEGAL_ENTITY_NAME
+      ,JS.PERIOD_NAME
+      ,JS.JE_NAME
+      ,JS.VOUCHER_NUMBER
+      ,JS.EFFECTIVE_DATE
+      ,JS.POSTED_DATE
+      ,JS.JE_SOURCE
+      ,JS.JE_CATEGORY
+      ,JS.JE_DESCRIPTION
+      ,JL.JE_LINE_NUM
+      ,JL.ACCOUNT_STRING
+      ,JL.ACCOUNT_DESCRIPTION
+      ,JL.ENTERED_DR
+      ,JL.ENTERED_CR
+      ,JL.ACCOUNTED_DR
+      ,JL.ACCOUNTED_CR
+      ,JL.LINE_DESCRIPTION
+      ,JS.TOTAL_DR HEADER_TOTAL_DR
+      ,JS.TOTAL_CR HEADER_TOTAL_CR
+      ,JS.LINE_COUNT HEADER_LINE_COUNT
+      ,JS.CREATED_BY
+      ,JS.CREATION_DATE
+FROM   JE_SUMMARY JS
+      ,JE_LINES JL
+WHERE  JS.JE_HEADER_ID = JL.JE_HEADER_ID
+ORDER BY JS.POSTED_DATE, JS.JE_NAME, JL.JE_LINE_NUM
+```
+
+---
+
+## 4. Enhanced Trial Balance (with Segment Breakdown)
+*Comprehensive trial balance with segment-wise analysis.*
+
+```sql
+/*
+TITLE: Enhanced Trial Balance with Segment Analysis
+PURPOSE: Detailed trial balance with hierarchical segment breakdown
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Period Balances
+BALANCES AS (
+    SELECT /*+ qb_name(BAL) MATERIALIZE */
+           GB.CODE_COMBINATION_ID
+          ,GCCK.CONCATENATED_SEGMENTS ACCOUNT_STRING
+          ,GCCK.SEGMENT1 COMPANY
+          ,GCCK.SEGMENT2 ACCOUNT_GROUP
+          ,GCCK.SEGMENT3 COST_CENTER
+          ,GCCK.SEGMENT4 NATURAL_ACCOUNT
+          ,GCCK.DESCRIPTION ACCOUNT_DESCRIPTION
+          -- Account Type Classification
+          ,CASE 
+             WHEN GCCK.SEGMENT4 BETWEEN '1000' AND '1999' THEN 'Assets'
+             WHEN GCCK.SEGMENT4 BETWEEN '2000' AND '2999' THEN 'Liabilities'
+             WHEN GCCK.SEGMENT4 BETWEEN '3000' AND '3999' THEN 'Equity'
+             WHEN GCCK.SEGMENT4 BETWEEN '4000' AND '4999' THEN 'Revenue'
+             WHEN GCCK.SEGMENT4 BETWEEN '5000' AND '9999' THEN 'Expense'
+             ELSE 'Other'
+           END ACCOUNT_TYPE
+          -- Beginning Balance
+          ,NVL(GB.BEGIN_BALANCE_DR, 0) - NVL(GB.BEGIN_BALANCE_CR, 0) BEGIN_BALANCE
+          -- Period Activity
+          ,NVL(GB.PERIOD_NET_DR, 0) PERIOD_DR
+          ,NVL(GB.PERIOD_NET_CR, 0) PERIOD_CR
+          ,NVL(GB.PERIOD_NET_DR, 0) - NVL(GB.PERIOD_NET_CR, 0) PERIOD_NET
+          -- Ending Balance
+          ,NVL(GB.BEGIN_BALANCE_DR, 0) - NVL(GB.BEGIN_BALANCE_CR, 0) + 
+           NVL(GB.PERIOD_NET_DR, 0) - NVL(GB.PERIOD_NET_CR, 0) END_BALANCE
+          -- Year-to-Date
+          ,NVL(GB.BEGIN_BALANCE_DR, 0) + NVL(GB.PERIOD_NET_DR, 0) - 
+           (NVL(GB.BEGIN_BALANCE_CR, 0) + NVL(GB.PERIOD_NET_CR, 0)) YTD_BALANCE
+    FROM   GL_BALANCES GB
+          ,GL_CODE_COMBINATIONS_KFV GCCK
+    WHERE  GB.CODE_COMBINATION_ID = GCCK.CODE_COMBINATION_ID
+      AND  GB.ACTUAL_FLAG = 'A'
+      AND  GB.LEDGER_ID = :P_LEDGER_ID
+      AND  GB.PERIOD_NAME = :P_PERIOD
+)
+SELECT 
+       ACCOUNT_TYPE
+      ,COMPANY
+      ,ACCOUNT_GROUP
+      ,COST_CENTER
+      ,NATURAL_ACCOUNT
+      ,ACCOUNT_STRING
+      ,ACCOUNT_DESCRIPTION
+      ,BEGIN_BALANCE
+      ,PERIOD_DR
+      ,PERIOD_CR
+      ,PERIOD_NET
+      ,END_BALANCE
+      ,YTD_BALANCE
+      -- Subtotals by Account Type
+      ,SUM(END_BALANCE) OVER (PARTITION BY ACCOUNT_TYPE) TYPE_TOTAL
+      -- Grand Totals
+      ,SUM(PERIOD_DR) OVER () GRAND_TOTAL_DR
+      ,SUM(PERIOD_CR) OVER () GRAND_TOTAL_CR
+FROM   BALANCES
+ORDER BY ACCOUNT_TYPE, COMPANY, NATURAL_ACCOUNT
+```

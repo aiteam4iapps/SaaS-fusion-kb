@@ -1,0 +1,1535 @@
+# AP Report Templates
+
+**Purpose:** Ready-to-use SQL skeletons for common AP reports.
+
+---
+
+## 0. PARAMS CTE Pattern (Standard for All Reports)
+*Use this pattern at the start of every AP report query.*
+
+```sql
+/*
+PARAMS CTE: Parameter normalization block
+- Always first CTE in query structure
+- Truncates dates to remove time component
+- Stores filter values for reuse in downstream CTEs
+*/
+
+PARAMS AS (
+    SELECT /*+ qb_name(PARAMS) */
+           TRUNC(:P_FROM_DATE) P_FROM_DATE
+          ,TRUNC(:P_TO_DATE) P_TO_DATE
+          ,:P_BU_ID P_BU_ID
+          ,:P_SUPPLIER_NUM P_SUPPLIER_NUM
+    FROM   DUAL
+)
+
+-- Usage in downstream CTEs:
+-- 1. Add PARAMS P to FROM clause
+-- 2. Reference via P.P_FROM_DATE, P.P_TO_DATE, etc.
+-- 3. Filter example: WHERE APT.GL_DATE < P.P_FROM_DATE
+-- 4. Multi-value filter: AND (APT.ORG_ID IN (P.P_BU_ID) OR 'All' IN (P.P_BU_ID || 'All'))
+```
+
+**Key Points:**
+- Date parameters passed as DATE type (no TO_DATE conversion needed)
+- `TRUNC()` ensures consistent date comparisons
+- All downstream CTEs cross-join PARAMS for parameter access
+- No semicolon at end of query (Oracle Fusion OTBI requirement)
+
+---
+
+## 1. AP Aging Report (Enhanced 14-Bucket)
+*Comprehensive aging with prepayment handling and 14 buckets.*
+
+```sql
+/*
+TITLE: AP Aging Report (Enhanced)
+PURPOSE: Age outstanding supplier invoices by due date with prepayment tracking
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Prepayment Tracking
+PREPAYMENT_AMOUNT AS (
+    SELECT /*+ qb_name(PREPAY_AMT) */
+           AIAP.INVOICE_ID
+          ,SUM(AIDI.AMOUNT * NVL(AIAI.EXCHANGE_RATE, 1)) APP_AMT
+    FROM   AP_INVOICES_ALL AIAP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDI
+          ,AP_INVOICES_ALL AIAI
+    WHERE  AIAP.INVOICE_ID = AIDP.INVOICE_ID
+      AND  AIDP.INVOICE_DISTRIBUTION_ID = AIDI.PREPAY_DISTRIBUTION_ID
+      AND  AIDI.INVOICE_ID = AIAI.INVOICE_ID
+      AND  AIAP.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT'
+      AND  AIAP.CANCELLED_DATE IS NULL
+      AND  AIDI.REVERSAL_FLAG = 'N'
+    GROUP BY AIAP.INVOICE_ID
+),
+-- Aging Calculation with 14 Buckets
+AGING_CALC AS (
+    SELECT /*+ qb_name(AGING) LEADING(PSA) */
+           PSA.INVOICE_ID
+          ,PSA.DUE_DATE
+          ,PSA.AMOUNT_REMAINING * NVL(AIA.EXCHANGE_RATE, 1) AMOUNT_REMAINING
+          ,TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE) DAYS_OVERDUE
+          ,CASE WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) < 0 THEN 'Not Yet Due'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 0 AND 7 THEN 'Bucket 0-7'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 8 AND 15 THEN 'Bucket 8-15'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 16 AND 30 THEN 'Bucket 16-30'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 31 AND 45 THEN 'Bucket 31-45'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 46 AND 60 THEN 'Bucket 46-60'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 61 AND 75 THEN 'Bucket 61-75'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 76 AND 90 THEN 'Bucket 76-90'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 91 AND 120 THEN 'Bucket 91-120'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 121 AND 150 THEN 'Bucket 121-150'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 151 AND 180 THEN 'Bucket 151-180'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 181 AND 360 THEN 'Bucket 181-360'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) BETWEEN 361 AND 720 THEN 'Bucket 361-720'
+                WHEN (TRUNC(:P_AS_OF_DATE) - TRUNC(PSA.DUE_DATE)) > 720 THEN 'Above 720'
+                ELSE 'Unknown' END AGING_BUCKET
+    FROM   AP_PAYMENT_SCHEDULES_ALL PSA
+          ,AP_INVOICES_ALL AIA
+    WHERE  PSA.INVOICE_ID = AIA.INVOICE_ID
+      AND  PSA.AMOUNT_REMAINING <> 0
+      AND  AIA.CANCELLED_DATE IS NULL
+      AND  PSA.ORG_ID = :P_ORG_ID
+      AND  TRUNC(AIA.INVOICE_DATE) <= :P_AS_OF_DATE
+)
+-- Final Selection
+SELECT 
+       FBU.BU_NAME
+      ,POS.SEGMENT1 VENDOR_NUMBER
+      ,POS.VENDOR_NAME
+      ,PSS.VENDOR_SITE_CODE
+      ,AIA.INVOICE_NUM
+      ,AIA.INVOICE_DATE
+      ,AC.DUE_DATE
+      ,AIA.GL_DATE
+      ,AIA.INVOICE_CURRENCY_CODE
+      ,AIA.INVOICE_AMOUNT
+      ,AIA.INVOICE_TYPE_LOOKUP_CODE
+      ,AIA.DESCRIPTION
+      ,AC.DAYS_OVERDUE
+      ,AC.AGING_BUCKET
+      ,NVL(PA.APP_AMT, 0) PREPAID_AMOUNT
+      ,AC.AMOUNT_REMAINING - NVL(PA.APP_AMT, 0) NET_AMOUNT_REMAINING
+      ,CASE WHEN AC.AGING_BUCKET = 'Not Yet Due' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_NOT_YET_DUE
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 0-7' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_0_7
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 8-15' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_8_15
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 16-30' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_16_30
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 31-45' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_31_45
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 46-60' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_46_60
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 61-75' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_61_75
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 76-90' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_76_90
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 91-120' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_91_120
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 121-150' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_121_150
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 151-180' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_151_180
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 181-360' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_181_360
+      ,CASE WHEN AC.AGING_BUCKET = 'Bucket 361-720' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_361_720
+      ,CASE WHEN AC.AGING_BUCKET = 'Above 720' 
+            THEN AC.AMOUNT_REMAINING ELSE 0 END BUCKET_ABOVE_720
+      ,PPNF.DISPLAY_NAME CREATED_BY_NAME
+      ,AIA.CREATION_DATE
+FROM   AGING_CALC AC
+      ,AP_INVOICES_ALL AIA
+      ,POZ_SUPPLIERS_V POS
+      ,POZ_SUPPLIER_SITES_V PSS
+      ,FUN_ALL_BUSINESS_UNITS_V FBU
+      ,PREPAYMENT_AMOUNT PA
+      ,PER_USERS PU
+      ,PER_PERSON_NAMES_F PPNF
+WHERE  AC.INVOICE_ID = AIA.INVOICE_ID
+  AND  AIA.VENDOR_ID = POS.VENDOR_ID(+)
+  AND  AIA.VENDOR_SITE_ID = PSS.VENDOR_SITE_ID(+)
+  AND  AIA.ORG_ID = FBU.BU_ID
+  AND  AIA.INVOICE_ID = PA.INVOICE_ID(+)
+  AND  AIA.CREATED_BY = PU.USER_ID(+)
+  AND  PU.PERSON_ID = PPNF.PERSON_ID(+)
+  AND  PPNF.NAME_TYPE(+) = 'GLOBAL'
+  AND  TRUNC(SYSDATE) BETWEEN TRUNC(PPNF.EFFECTIVE_START_DATE(+)) 
+                          AND TRUNC(PPNF.EFFECTIVE_END_DATE(+))
+  AND  (FBU.BU_NAME IN (:P_BU_NAME) OR 'All' IN (:P_BU_NAME || 'All'))
+  AND  (POS.VENDOR_NAME IN (:P_VENDOR) OR 'All' IN (:P_VENDOR || 'All'))
+ORDER BY FBU.BU_NAME, POS.VENDOR_NAME, AIA.INVOICE_NUM
+```
+
+---
+
+## 2. AP Invoice Register
+*Detailed listing of invoices for a period.*
+
+```sql
+/*
+TITLE: AP Invoice Register
+PURPOSE: List all invoices entered in a period with approval tracking
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Approval History
+APPROVER AS (
+    SELECT /*+ qb_name(APPROVER) */
+           MAX(AIAHA.ACTION_DATE) APPROVAL_DATE
+          ,MAX(PPNF.DISPLAY_NAME) APPROVER_NAME
+          ,AIAHA.INVOICE_ID
+    FROM   AP_INV_APRVL_HIST_ALL AIAHA
+          ,PER_USERS PU
+          ,PER_PERSON_NAMES_F PPNF
+    WHERE  AIAHA.APPROVER_ID = PU.USERNAME(+)
+      AND  PU.PERSON_ID = PPNF.PERSON_ID(+)
+      AND  PPNF.NAME_TYPE (+) = 'GLOBAL'
+      AND  AIAHA.RESPONSE = 'APPROVED'
+      AND  TRUNC(SYSDATE) BETWEEN TRUNC(PPNF.EFFECTIVE_START_DATE(+)) 
+                              AND TRUNC(PPNF.EFFECTIVE_END_DATE(+))
+    GROUP BY AIAHA.INVOICE_ID
+),
+-- Invoice Master Data
+MASTER_DATA AS (
+    SELECT /*+ qb_name(MAIN) LEADING(AIA) */
+           FBU.BU_NAME
+          ,POS.SEGMENT1 SUPPLIER_NUMBER
+          ,POS.VENDOR_NAME SUPPLIER_NAME
+          ,PSS.VENDOR_SITE_CODE
+          ,AIA.INVOICE_NUM
+          ,AIA.INVOICE_DATE
+          ,AIA.DESCRIPTION
+          ,AIA.INVOICE_CURRENCY_CODE
+          ,AIA.INVOICE_AMOUNT
+          ,APS.DUE_DATE INVOICE_DUE_DATE
+          ,ACA.CHECK_NUMBER PAYMENT_NUMBER
+          ,ACA.CHECK_DATE PAYMENT_DATE
+          ,ACA.AMOUNT PAYMENT_AMOUNT
+          ,AIA.INVOICE_RECEIVED_DATE
+          ,ACA.STATUS_LOOKUP_CODE PAYMENT_STATUS
+          ,AP.APPROVAL_DATE
+          ,AP.APPROVER_NAME
+          ,AIP.ACCOUNTING_DATE
+          ,DECODE (AIA.APPROVAL_STATUS,
+                   'FULL', 'FULLY APPLIED',
+                   'NEVER APPROVED', 'NEVER VALIDATED',
+                   'NEEDS REAPPROVAL', 'NEEDS REVALIDATION',
+                   'CANCELLED', 'CANCELLED',
+                   'UNPAID', 'UNPAID',
+                   'AVAILABLE', 'AVAILABLE',
+                   'UNAPPROVED', 'UNVALIDATED',
+                   'APPROVED', 'VALIDATED',
+                   'PERMANENT', 'PERMANENT PREPAYMENT',
+                   NULL
+           ) INV_APPROVAL_STATUS
+    FROM   AP_INVOICES_ALL AIA
+          ,POZ_SUPPLIERS_V POS
+          ,POZ_SUPPLIER_SITES_V PSS
+          ,FUN_ALL_BUSINESS_UNITS_V FBU
+          ,AP_PAYMENT_SCHEDULES_ALL APS
+          ,AP_INVOICE_PAYMENTS_ALL AIP
+          ,AP_CHECKS_ALL ACA
+          ,APPROVER AP
+    WHERE  AIA.VENDOR_ID = POS.VENDOR_ID(+)
+      AND  AIA.VENDOR_SITE_ID = PSS.VENDOR_SITE_ID(+)
+      AND  AIA.ORG_ID = FBU.BU_ID
+      AND  AIA.INVOICE_ID = APS.INVOICE_ID(+)
+      AND  AIA.INVOICE_ID = AIP.INVOICE_ID(+)
+      AND  AIP.CHECK_ID = ACA.CHECK_ID(+)
+      AND  AIA.INVOICE_ID = AP.INVOICE_ID(+)
+      AND  AIA.CANCELLED_DATE IS NULL
+      AND  TRUNC(AIA.INVOICE_DATE) BETWEEN :P_FROM_DATE AND :P_TO_DATE
+      AND  AIA.ORG_ID = :P_ORG_ID
+      AND  SIGN(AIP.AMOUNT(+)) != -1
+)
+SELECT * FROM MASTER_DATA ORDER BY INVOICE_DATE, INVOICE_NUM
+```
+
+---
+
+## 3. AP Ledger/Statement Report
+*Supplier ledger with opening balance and all transaction types.*
+
+```sql
+/*
+TITLE: AP Supplier Ledger/Statement
+PURPOSE: Complete supplier ledger with opening balance
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Prepayment Applications
+PREPAY_TRX AS (
+    SELECT /*+ qb_name(PREPAY_TRX) */
+           AIAP.INVOICE_ID
+          ,AIAP.INVOICE_NUM
+          ,AIAI.INVOICE_ID APP_INVOICE_ID
+          ,AIAI.INVOICE_NUM APP_INVOICE_NUM
+          ,AIAI.INVOICE_DATE APP_INVOICE_DATE
+          ,ABS(SUM(AIDI.AMOUNT)) APP_AMOUNT
+          ,NVL(AIAP.EXCHANGE_RATE,1) EXCHANGE_RATE
+          ,NVL(AIAI.EXCHANGE_RATE,1) APP_EXC_RATE
+    FROM   AP_INVOICES_ALL AIAP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDI
+          ,AP_INVOICES_ALL AIAI
+    WHERE  AIAP.INVOICE_ID = AIDP.INVOICE_ID
+      AND  AIDP.INVOICE_DISTRIBUTION_ID = AIDI.PREPAY_DISTRIBUTION_ID
+      AND  AIDI.INVOICE_ID = AIAI.INVOICE_ID
+      AND  AIAP.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT'
+      AND  AIDI.REVERSAL_FLAG = 'N'
+      AND  AIAP.CANCELLED_DATE IS NULL
+      AND  TRUNC(AIDI.ACCOUNTING_DATE) <= :P_TO_DATE
+    GROUP BY AIAP.INVOICE_ID, AIAP.INVOICE_NUM, AIAI.INVOICE_ID, 
+             AIAI.INVOICE_NUM, AIAI.INVOICE_DATE, 
+             NVL(AIAP.EXCHANGE_RATE,1), NVL(AIAI.EXCHANGE_RATE,1)
+),
+-- All Transaction Types Union
+AP_TRX AS (
+    -- Invoice Transactions (Standard/PREPAYMENT)
+    SELECT 1 NUM
+          ,AIA.INVOICE_ID TRX_ID
+          ,AIA.INVOICE_NUM
+          ,AIA.INVOICE_DATE TRX_DATE
+          ,MAX(AID.ACCOUNTING_DATE) GL_DATE
+          ,'Invoice' TRX_TYPE
+          ,AIA.DESCRIPTION TRX_DESC
+          ,AIA.INVOICE_CURRENCY_CODE CURRENCY_CODE
+          ,CASE WHEN SIGN(SUM(AID.AMOUNT)) = -1 THEN SUM(AID.AMOUNT) * -1 ELSE NULL END AMOUNT_DR
+          ,CASE WHEN SIGN(SUM(AID.AMOUNT)) = 1 THEN SUM(AID.AMOUNT) ELSE NULL END AMOUNT_CR
+          ,CASE WHEN SIGN(SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1))) = -1 
+                THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) * -1 
+                ELSE NULL END ACCT_AMOUNT_DR
+          ,CASE WHEN SIGN(SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1))) = 1 
+                THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) 
+                ELSE NULL END ACCT_AMOUNT_CR
+          ,AIA.VENDOR_ID
+          ,AIA.VENDOR_SITE_ID
+          ,AIA.ORG_ID
+    FROM   AP_INVOICES_ALL AIA
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AID
+    WHERE  AIA.INVOICE_ID = AID.INVOICE_ID
+      AND  AIA.CANCELLED_DATE IS NULL
+      AND  TRUNC(AID.ACCOUNTING_DATE) BETWEEN :P_FROM_DATE AND :P_TO_DATE
+    GROUP BY AIA.INVOICE_ID, AIA.INVOICE_NUM, AIA.INVOICE_DATE, AIA.DESCRIPTION,
+             AIA.INVOICE_CURRENCY_CODE, AIA.VENDOR_ID, AIA.VENDOR_SITE_ID, 
+             AIA.ORG_ID, AIA.EXCHANGE_RATE
+    HAVING SUM(AID.AMOUNT) <> 0
+    
+    UNION ALL
+    -- Payment Transactions
+    SELECT 4 NUM
+          ,ACA.CHECK_ID
+          ,TO_CHAR(ACA.CHECK_NUMBER) INVOICE_NUM
+          ,ACA.CHECK_DATE
+          ,MAX(AIP.ACCOUNTING_DATE)
+          ,'Payment'
+          ,ACA.DESCRIPTION
+          ,ACA.CURRENCY_CODE
+          ,CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0))) = 1 
+                THEN SUM(NVL(AIP.AMOUNT, 0)) ELSE NULL END
+          ,CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0))) = -1 
+                THEN SUM(NVL(AIP.AMOUNT, 0)) * -1 ELSE NULL END
+          ,CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0))) = 1 
+                THEN SUM(NVL(AIP.AMOUNT, 0) * NVL(ACA.EXCHANGE_RATE, 1)) ELSE NULL END
+          ,CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0))) = -1 
+                THEN SUM(NVL(AIP.AMOUNT, 0) * NVL(ACA.EXCHANGE_RATE, 1)) * -1 ELSE NULL END
+          ,ACA.VENDOR_ID
+          ,ACA.VENDOR_SITE_ID
+          ,ACA.ORG_ID
+    FROM   AP_CHECKS_ALL ACA
+          ,AP_INVOICE_PAYMENTS_ALL AIP
+    WHERE  ACA.CHECK_ID = AIP.CHECK_ID
+      AND  ACA.VOID_DATE IS NULL
+      AND  TRUNC(AIP.ACCOUNTING_DATE) BETWEEN :P_FROM_DATE AND :P_TO_DATE
+    GROUP BY ACA.CHECK_ID, TO_CHAR(ACA.CHECK_NUMBER), ACA.CHECK_DATE, ACA.DESCRIPTION,
+             ACA.CURRENCY_CODE, ACA.VENDOR_ID, ACA.VENDOR_SITE_ID, ACA.ORG_ID, ACA.EXCHANGE_RATE
+)
+-- Final Selection with Opening Balance
+SELECT FBU.BU_NAME
+      ,POS.SEGMENT1 VENDOR_NUM
+      ,POS.VENDOR_NAME
+      ,PSS.VENDOR_SITE_CODE
+      ,APT.INVOICE_NUM
+      ,APT.TRX_DATE
+      ,APT.GL_DATE
+      ,APT.TRX_TYPE
+      ,APT.CURRENCY_CODE
+      ,APT.TRX_DESC
+      ,APT.AMOUNT_DR
+      ,APT.AMOUNT_CR
+      ,APT.ACCT_AMOUNT_DR
+      ,APT.ACCT_AMOUNT_CR
+FROM   AP_TRX APT
+      ,POZ_SUPPLIERS_V POS
+      ,POZ_SUPPLIER_SITES_V PSS
+      ,FUN_ALL_BUSINESS_UNITS_V FBU
+WHERE  APT.VENDOR_ID = POS.VENDOR_ID(+)
+  AND  APT.VENDOR_SITE_ID = PSS.VENDOR_SITE_ID(+)
+  AND  APT.ORG_ID = FBU.BU_ID
+  AND  (FBU.BU_NAME IN (:P_BU_ID) OR 'All' IN (:P_BU_ID || 'All'))
+  AND  (POS.VENDOR_NAME IN (:P_VENDOR) OR 'All' IN (:P_VENDOR || 'All'))
+ORDER BY POS.VENDOR_NAME, APT.TRX_DATE, APT.INVOICE_NUM
+```
+
+---
+
+## 4. AP Payment Voucher Report
+*Payment voucher with bank details and distribution breakdown.*
+
+```sql
+/*
+TITLE: AP Bank Payment Voucher
+PURPOSE: Payment voucher for bank processing with distribution details
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+-- Dataset 1: Payment Header
+WITH PAYMENT_HEADER AS (
+    SELECT ACA.CHECK_ID
+          ,ACA.AMOUNT
+          ,REPLACE(IBY_AMOUNT_IN_WORDS.GET_AMOUNT_IN_WORDS(
+               ROUND(ABS(ACA.AMOUNT * NVL(ACA.EXCHANGE_RATE, 1)), 2),
+               GLL.CURRENCY_CODE), '-', ' ') AMT_WORDS
+          ,ACA.DOC_SEQUENCE_VALUE
+          ,ACA.CHECK_DATE
+          ,ACA.CHECK_NUMBER
+          ,ACA.CREATED_BY
+          ,NVL(ACA.AMOUNT, 0) * NVL(ACA.EXCHANGE_RATE, 1) CHECK_CREDIT
+          ,CBA.ASSET_CODE_COMBINATION_ID
+          ,FND_FLEX_EXT.GET_SEGS('GL', 'GL#', GCC.CHART_OF_ACCOUNTS_ID, 
+               GCC.CODE_COMBINATION_ID) CR_CODE_ID
+          ,GL_FLEXFIELDS_PKG.GET_CONCAT_DESCRIPTION(GCC.CHART_OF_ACCOUNTS_ID,
+               GCC.CODE_COMBINATION_ID) GL_CODE_DESC_CR
+          ,ACA.VENDOR_NAME
+          ,PSV.SEGMENT1 VENDOR_NUMBER
+          ,ACA.VENDOR_SITE_CODE
+          ,IPA.INT_BANK_ACCOUNT_NAME BANK_ACCOUNT_NAME
+          ,IPA.INT_BANK_BRANCH_NAME
+          ,ACA.CURRENCY_CODE
+          ,ACA.DESCRIPTION COMMENTS
+          ,HAOU.NAME ORG_NAME
+          ,CASE WHEN APHA.POSTED_FLAG = 'Y' THEN 'ACCOUNTED' ELSE 'UNACCOUNTED' END STATUS
+    FROM   AP_CHECKS_ALL ACA
+          ,AP_PAYMENT_HISTORY_ALL APHA
+          ,POZ_SUPPLIERS_V PSV
+          ,IBY_PAYMENTS_ALL IPA
+          ,CE_BANK_ACCOUNTS CBA
+          ,GL_CODE_COMBINATIONS GCC
+          ,HR_OPERATING_UNITS HAOU
+          ,GL_LEDGERS GLL
+    WHERE  ACA.VENDOR_ID = PSV.VENDOR_ID(+)
+      AND  ACA.PAYMENT_ID = IPA.PAYMENT_ID
+      AND  IPA.INTERNAL_BANK_ACCOUNT_ID = CBA.BANK_ACCOUNT_ID
+      AND  CBA.ASSET_CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID
+      AND  ACA.ORG_ID = HAOU.ORGANIZATION_ID
+      AND  HAOU.SET_OF_BOOKS_ID = GLL.LEDGER_ID(+)
+      AND  APHA.CHECK_ID(+) = ACA.CHECK_ID
+      AND  ACA.VOID_DATE IS NULL
+      AND  HAOU.ORGANIZATION_ID = :P_ORG_NAME
+      AND  TRUNC(ACA.CHECK_DATE) BETWEEN NVL(:P_FROM_DATE, TRUNC(ACA.CHECK_DATE))
+                                     AND NVL(:P_TO_DATE, TRUNC(ACA.CHECK_DATE))
+      AND  ACA.CHECK_NUMBER BETWEEN NVL(:P_CHECK_FROM, ACA.CHECK_NUMBER) 
+                                AND NVL(:P_CHECK_TO, ACA.CHECK_NUMBER)
+)
+SELECT * FROM PAYMENT_HEADER
+ORDER BY CHECK_DATE, CHECK_NUMBER;
+
+-- Dataset 2: Payment Distribution Lines
+WITH PAYMENT_DIST AS (
+    SELECT XTE.SOURCE_ID_INT_1 CHECK_ID
+          ,AIA.INVOICE_ID
+          ,AIA.INVOICE_NUM
+          ,AIA.DESCRIPTION INV_DESCRIPTION
+          ,FND_FLEX_EXT.GET_SEGS('GL', 'GL#', GCC.CHART_OF_ACCOUNTS_ID,
+               GCC.CODE_COMBINATION_ID) ID_CODE_ID
+          ,GL_FLEXFIELDS_PKG.GET_CONCAT_DESCRIPTION(GCC.CHART_OF_ACCOUNTS_ID,
+               GCC.CODE_COMBINATION_ID) GL_CODE_DESC
+          ,NVL(SUM(XAL.ACCOUNTED_DR), 0) - NVL(SUM(XAL.ACCOUNTED_CR), 0) DIST_DEBIT
+    FROM   XLA_TRANSACTION_ENTITIES XTE
+          ,XLA_EVENTS XE
+          ,XLA_AE_HEADERS XAH
+          ,XLA_AE_LINES XAL
+          ,GL_CODE_COMBINATIONS GCC
+          ,(SELECT XDL.APPLICATION_ID, XDL.AE_HEADER_ID, XDL.AE_LINE_NUM,
+                   AIA.INVOICE_ID, AIA.INVOICE_NUM, AIA.DESCRIPTION
+            FROM   XLA_DISTRIBUTION_LINKS XDL, AP_INVOICES_ALL AIA
+            WHERE  XDL.APPLIED_TO_SOURCE_ID_NUM_1 = AIA.INVOICE_ID(+)
+              AND  XDL.APPLICATION_ID = 200
+              AND  XDL.EVENT_TYPE_CODE IN ('PAYMENT CREATED', 'INVOICE VALIDATED')
+            GROUP BY XDL.APPLICATION_ID, XDL.AE_HEADER_ID, XDL.AE_LINE_NUM,
+                     AIA.INVOICE_ID, AIA.INVOICE_NUM, AIA.DESCRIPTION) AIA
+    WHERE  XTE.APPLICATION_ID = XE.APPLICATION_ID
+      AND  XTE.ENTITY_ID = XE.ENTITY_ID
+      AND  XE.APPLICATION_ID = XAH.APPLICATION_ID
+      AND  XE.ENTITY_ID = XAH.ENTITY_ID
+      AND  XE.EVENT_ID = XAH.EVENT_ID
+      AND  XAH.AE_HEADER_ID = XAL.AE_HEADER_ID
+      AND  XAL.CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID
+      AND  XAL.APPLICATION_ID = AIA.APPLICATION_ID(+)
+      AND  XAL.AE_HEADER_ID = AIA.AE_HEADER_ID(+)
+      AND  XAL.AE_LINE_NUM = AIA.AE_LINE_NUM(+)
+      AND  XTE.APPLICATION_ID = 200
+      AND  XTE.ENTITY_CODE IN ('AP_PAYMENTS', 'AP_INVOICES')
+      AND  XE.EVENT_TYPE_CODE IN ('PAYMENT CREATED', 'INVOICE VALIDATED')
+      AND  XAL.ACCOUNTING_CLASS_CODE IN ('LIABILITY', 'LOSS', 'GAIN', 'ITEM EXPENSE')
+    GROUP BY XTE.SOURCE_ID_INT_1, AIA.INVOICE_ID, AIA.INVOICE_NUM, AIA.DESCRIPTION,
+             FND_FLEX_EXT.GET_SEGS('GL', 'GL#', GCC.CHART_OF_ACCOUNTS_ID, GCC.CODE_COMBINATION_ID),
+             GL_FLEXFIELDS_PKG.GET_CONCAT_DESCRIPTION(GCC.CHART_OF_ACCOUNTS_ID, GCC.CODE_COMBINATION_ID)
+    HAVING (NVL(SUM(XAL.ACCOUNTED_DR), 0) - NVL(SUM(XAL.ACCOUNTED_CR), 0)) <> 0
+)
+SELECT * FROM PAYMENT_DIST
+ORDER BY CHECK_ID, INVOICE_NUM
+```
+
+---
+
+## 5. AP Ledger Report (Complete Transaction Ledger)
+*Complete AP ledger with invoices, payments, prepayments, and opening balance.*
+
+### Overview
+- **Row Grain**: Invoice header level (distributions aggregated per invoice)
+- **Output**: 30 columns including BU, Supplier, DFF attributes, amounts, VAT breakdown
+- **Transaction Types**: 7 types (Standard Invoice, Credit/Debit Memo, Prepayment Invoice Payment, Payment, Void Payment, Prepayment Application, Discount)
+- **Blocks**: Opening Balance (Block 1) + Period Transactions (Block 2)
+- **Key Features**: 
+  - Prepayment invoice payment tracking (unpaid/partially paid)
+  - Proper payment allocation for credit/debit memos
+  - Pay group lookup integration
+  - Running balance calculation
+  - Index suppression hints for optimization
+  - Party-based supplier fallback for negative VENDOR_ID
+
+### Parameters (4 Required)
+```sql
+:P_FROM_DATE    -- DATE (start date for GL_DATE filter)
+:P_TO_DATE      -- DATE (end date for GL_DATE filter)
+:P_BU_ID        -- VARCHAR2 (supports 'All' or comma-separated list)
+:P_SUPPLIER_NUM -- VARCHAR2 (supports 'All' or comma-separated list)
+```
+
+### Complete Implementation Pattern
+**Reference**: `.cursor/29-12-25/AP_Ledger_Report.sql` (validated production version)
+
+```sql
+/*
+TITLE: AP Ledger Report
+PURPOSE: Complete AP Ledger with invoices, payments, prepayments, and opening balance
+MODULE: Accounts Payable (AP)
+DATE: 29-12-25
+REFERENCE: Validated implementation in .cursor/29-12-25/AP_Ledger_Report.sql
+*/
+
+WITH
+-- ============================================================================
+-- BLOCK 0: PARAMETERS
+-- ============================================================================
+PARAMS AS (
+    SELECT /*+ qb_name(PARAMS) */
+           :P_FROM_DATE P_FROM_DATE
+          ,:P_TO_DATE P_TO_DATE
+          ,:P_BU_ID P_BU_ID
+          ,:P_SUPPLIER_NUM P_SUPPLIER_NUM
+    FROM   DUAL
+),
+
+-- ============================================================================
+-- BLOCK 1: PREPAYMENT TRACKING
+-- ============================================================================
+PREPAY_TRX AS (
+    SELECT /*+ qb_name(PREPAY_TRX) MATERIALIZE */
+           AIAP.INVOICE_ID
+          ,AIAP.INVOICE_NUM
+          ,AIAP.PO_HEADER_ID
+          ,AIAP.DESCRIPTION
+          ,AIAP.PAY_GROUP_LOOKUP_CODE PAY_GROUP_CODE
+          ,AIAI.INVOICE_ID APP_INVOICE_ID
+          ,AIAI.INVOICE_NUM APP_INVOICE_NUM
+          ,AIAI.INVOICE_DATE APP_INVOICE_DATE
+          ,ABS(SUM(AIDI.AMOUNT)) APP_AMOUNT
+          ,NVL(AIAP.EXCHANGE_RATE, 1) EXCHANGE_RATE
+          ,NVL(AIAI.EXCHANGE_RATE, 1) APP_EXC_RATE
+    FROM   AP_INVOICES_ALL AIAP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDI
+          ,AP_INVOICES_ALL AIAI
+    WHERE  AIAP.INVOICE_ID = AIDP.INVOICE_ID
+      AND  AIDP.INVOICE_DISTRIBUTION_ID = AIDI.PREPAY_DISTRIBUTION_ID
+      AND  AIDI.INVOICE_ID = AIAI.INVOICE_ID
+      AND  AIAP.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT'
+      AND  AIDI.REVERSAL_FLAG = 'N'
+      AND  AIAP.CANCELLED_DATE IS NULL
+    GROUP BY AIAP.INVOICE_ID, AIAP.INVOICE_NUM, AIAP.PO_HEADER_ID,
+             AIAP.DESCRIPTION, AIAP.PAY_GROUP_LOOKUP_CODE, AIAI.INVOICE_ID,
+             AIAI.INVOICE_NUM, AIAI.INVOICE_DATE, 
+             NVL(AIAP.EXCHANGE_RATE, 1), NVL(AIAI.EXCHANGE_RATE, 1)
+),
+
+-- ============================================================================
+-- BLOCK 2: TRANSACTION UNION - ALL 7 TRANSACTION TYPES
+-- ============================================================================
+AP_TRX AS (
+    -- ========================================================================
+    -- 2.1: STANDARD INVOICES (excluding Credit/Debit)
+    -- ========================================================================
+    SELECT /*+ qb_name(AP_INV_STD) */
+           1 NUM
+          ,AIA.INVOICE_ID TRX_ID
+          ,AIA.INVOICE_ID INVOICE_ID
+          ,AIA.INVOICE_NUM INVOICE_NUM
+          ,NULL CHECK_NUM
+          ,TO_CHAR(AIA.DOC_SEQUENCE_VALUE) DOCUMENT_NUM
+          ,'Invoice' TRX_SOURCE
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'STANDARD' 
+                THEN 'Invoice'
+                ELSE ALC.DISPLAYED_FIELD END TRX_TYPE
+          ,AIA.INVOICE_TYPE_LOOKUP_CODE
+          ,AIA.PARTY_ID
+          ,AIA.PARTY_SITE_ID
+          ,AIA.DESCRIPTION TRX_DESC
+          ,AIA.INVOICE_DATE TRX_DATE
+          ,MAX(AID.ACCOUNTING_DATE) GL_DATE
+          ,AIA.INVOICE_CURRENCY_CODE CURRENCY_CODE
+          ,AIA.EXCHANGE_RATE_TYPE
+          ,AIA.EXCHANGE_RATE
+          ,AIA.VENDOR_ID
+          ,AIA.VENDOR_SITE_ID
+          ,AIA.ORG_ID
+          ,FLV.MEANING PAY_GROUP
+          ,AIA.PO_HEADER_ID
+          ,AIA.ACCTS_PAY_CODE_COMBINATION_ID
+          ,AIA.TOTAL_TAX_AMOUNT
+          ,AIA.INVOICE_AMOUNT INV_AMOUNT
+          ,(SELECT LISTAGG(AILA.TAX_RATE_CODE, ',') WITHIN GROUP (ORDER BY AILA.INVOICE_ID)
+            FROM AP_INVOICE_LINES_ALL AILA
+            WHERE AILA.INVOICE_ID = AIA.INVOICE_ID) VAT_CODE
+          ,AIA.ATTRIBUTE1 POLICY_NO
+          ,AIA.ATTRIBUTE2 CLAIM_NO
+          ,AIA.ATTRIBUTE8 REF_NO
+          ,AIA.ATTRIBUTE3 CUST_NAME
+          ,AIA.ATTRIBUTE4 INTERMEDIARY
+          ,AIA.ATTRIBUTE5 LOB
+          ,AIA.ATTRIBUTE6 ENTRY_TYPE
+          ,AIA.ATTRIBUTE13 REINSURER
+          ,AIA.SOURCE
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'STANDARD' AND AIA.APPROVAL_STATUS = 'APPROVED' 
+                THEN 'Standard Invoice'
+                WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'STANDARD' AND AIA.APPROVAL_STATUS = 'CANCELLED' 
+                THEN 'Cancel Invoice'
+                ELSE NULL END DESCRIPTION1
+          ,NULL PREPAY_NUM
+          ,AIA.INVOICE_ID INVOICE_ID_P
+          ,AIA.INVOICE_NUM INVOICE_NUM_P
+          ,AIA.INVOICE_DATE INVOICE_DATE_P
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = -1 THEN SUM(AID.AMOUNT) * -1 ELSE NULL END) AMOUNT_DR
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = 1 THEN SUM(AID.AMOUNT) ELSE NULL END) AMOUNT_CR
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = -1 
+                 THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) * -1 
+                 ELSE NULL END) ACCT_AMOUNT_DR
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = 1 
+                 THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) 
+                 ELSE NULL END) ACCT_AMOUNT_CR
+    FROM   AP_INVOICES_ALL AIA
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AID
+          ,AP_LOOKUP_CODES ALC
+          ,FND_LOOKUP_VALUES_VL FLV
+    WHERE  AIA.INVOICE_ID = AID.INVOICE_ID
+      AND  AIA.INVOICE_TYPE_LOOKUP_CODE = ALC.LOOKUP_CODE(+)
+      AND  ALC.LOOKUP_TYPE(+) = 'INVOICE TYPE'
+      AND  AIA.PAY_GROUP_LOOKUP_CODE = FLV.LOOKUP_CODE(+)
+      AND  FLV.LOOKUP_TYPE(+) = 'PAY GROUP'
+      AND  AIA.INVOICE_TYPE_LOOKUP_CODE NOT IN ('CREDIT', 'DEBIT')
+      AND  AIA.CANCELLED_DATE IS NULL
+      AND  AIA.INVOICE_ID = AIA.INVOICE_ID + 0
+    GROUP BY AIA.INVOICE_ID, AIA.INVOICE_NUM, TO_CHAR(AIA.DOC_SEQUENCE_VALUE),
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'STANDARD' THEN 'Invoice' ELSE ALC.DISPLAYED_FIELD END,
+             AIA.INVOICE_TYPE_LOOKUP_CODE, AIA.PARTY_ID, AIA.PARTY_SITE_ID,
+             AIA.DESCRIPTION, AIA.INVOICE_DATE, AIA.INVOICE_CURRENCY_CODE,
+             AIA.EXCHANGE_RATE_TYPE, AIA.EXCHANGE_RATE, AIA.VENDOR_ID,
+             AIA.VENDOR_SITE_ID, AIA.ORG_ID, FLV.MEANING, AIA.PO_HEADER_ID,
+             AIA.ACCTS_PAY_CODE_COMBINATION_ID, AIA.TOTAL_TAX_AMOUNT, AIA.INVOICE_AMOUNT,
+             AIA.ATTRIBUTE1, AIA.ATTRIBUTE2, AIA.ATTRIBUTE8, AIA.ATTRIBUTE3,
+             AIA.ATTRIBUTE4, AIA.ATTRIBUTE5, AIA.ATTRIBUTE6, AIA.ATTRIBUTE13,
+             AIA.SOURCE, 
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'STANDARD' AND AIA.APPROVAL_STATUS = 'APPROVED' 
+                  THEN 'Standard Invoice'
+                  WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'STANDARD' AND AIA.APPROVAL_STATUS = 'CANCELLED' 
+                  THEN 'Cancel Invoice' ELSE NULL END,
+             AIA.INVOICE_NUM, AIA.INVOICE_DATE
+
+    UNION ALL
+    -- ========================================================================
+    -- 2.2: CREDIT AND DEBIT MEMOS
+    -- ========================================================================
+    SELECT /*+ qb_name(AP_INV_CD_DB) */
+           2 NUM
+          ,AIA.INVOICE_ID
+          ,AIA.INVOICE_ID
+          ,AIA.INVOICE_NUM
+          ,NULL
+          ,TO_CHAR(AIA.DOC_SEQUENCE_VALUE)
+          ,'Invoice'
+          ,ALC.DISPLAYED_FIELD
+          ,AIA.INVOICE_TYPE_LOOKUP_CODE
+          ,AIA.PARTY_ID
+          ,AIA.PARTY_SITE_ID
+          ,AIA.DESCRIPTION
+          ,AIA.INVOICE_DATE
+          ,MAX(AID.ACCOUNTING_DATE)
+          ,AIA.INVOICE_CURRENCY_CODE
+          ,AIA.EXCHANGE_RATE_TYPE
+          ,AIA.EXCHANGE_RATE
+          ,AIA.VENDOR_ID
+          ,AIA.VENDOR_SITE_ID
+          ,AIA.ORG_ID
+          ,FLV.MEANING
+          ,AIA.PO_HEADER_ID
+          ,AIA.ACCTS_PAY_CODE_COMBINATION_ID
+          ,AIA.TOTAL_TAX_AMOUNT
+          ,AIA.INVOICE_AMOUNT
+          ,AIL.TAX_RATE_CODE
+          ,AIA.ATTRIBUTE1
+          ,AIA.ATTRIBUTE2
+          ,AIA.ATTRIBUTE8
+          ,AIA.ATTRIBUTE3
+          ,AIA.ATTRIBUTE4
+          ,AIA.ATTRIBUTE5
+          ,AIA.ATTRIBUTE6
+          ,AIA.ATTRIBUTE13
+          ,AIA.SOURCE
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'DEBIT' THEN 'Debit Memo'
+                WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'CREDIT' THEN 'Credit Memo' 
+                ELSE NULL END
+          ,AIAC.INVOICE_NUM
+          ,NVL(AIAC.INVOICE_ID, AIA.INVOICE_ID)
+          ,NVL(AIAC.INVOICE_NUM, AIA.INVOICE_NUM)
+          ,NVL(AIAC.INVOICE_DATE, AIA.INVOICE_DATE)
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = -1 THEN SUM(AID.AMOUNT) * -1 ELSE NULL END)
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = 1 THEN SUM(AID.AMOUNT) ELSE NULL END)
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = -1 
+                 THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) * -1 
+                 ELSE NULL END)
+          ,(CASE WHEN SIGN(SUM(AID.AMOUNT)) = 1 
+                 THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) 
+                 ELSE NULL END)
+    FROM   AP_INVOICES_ALL AIA
+          ,AP_INVOICE_LINES_ALL AIL
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AID
+          ,AP_INVOICES_ALL AIAC
+          ,AP_LOOKUP_CODES ALC
+          ,FND_LOOKUP_VALUES_VL FLV
+    WHERE  AIA.INVOICE_ID = AIL.INVOICE_ID
+      AND  AIL.INVOICE_ID = AID.INVOICE_ID
+      AND  AIL.LINE_NUMBER = AID.INVOICE_LINE_NUMBER
+      AND  AIL.CORRECTED_INV_ID = AIAC.INVOICE_ID(+)
+      AND  AIA.INVOICE_TYPE_LOOKUP_CODE = ALC.LOOKUP_CODE(+)
+      AND  ALC.LOOKUP_TYPE(+) = 'INVOICE TYPE'
+      AND  AIA.PAY_GROUP_LOOKUP_CODE = FLV.LOOKUP_CODE(+)
+      AND  FLV.LOOKUP_TYPE(+) = 'PAY GROUP'
+      AND  AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT')
+      AND  AID.LINE_TYPE_LOOKUP_CODE <> 'PREPAY'
+      AND  AID.PREPAY_DISTRIBUTION_ID IS NULL
+      AND  AIA.CANCELLED_DATE IS NULL
+      AND  AIA.INVOICE_ID = AIA.INVOICE_ID + 0
+    GROUP BY AIA.INVOICE_ID, AIA.INVOICE_NUM, TO_CHAR(AIA.DOC_SEQUENCE_VALUE),
+             ALC.DISPLAYED_FIELD, AIA.INVOICE_TYPE_LOOKUP_CODE, AIA.PARTY_ID,
+             AIA.PARTY_SITE_ID, AIA.DESCRIPTION, AIA.INVOICE_DATE,
+             AIA.INVOICE_CURRENCY_CODE, AIA.EXCHANGE_RATE_TYPE, AIA.EXCHANGE_RATE,
+             AIA.VENDOR_ID, AIA.VENDOR_SITE_ID, AIA.ORG_ID, FLV.MEANING,
+             AIA.PO_HEADER_ID, AIA.ACCTS_PAY_CODE_COMBINATION_ID, AIA.TOTAL_TAX_AMOUNT,
+             AIA.INVOICE_AMOUNT, AIL.TAX_RATE_CODE, AIA.ATTRIBUTE1, AIA.ATTRIBUTE2,
+             AIA.ATTRIBUTE8, AIA.ATTRIBUTE3, AIA.ATTRIBUTE4, AIA.ATTRIBUTE5,
+             AIA.ATTRIBUTE6, AIA.ATTRIBUTE13, AIA.SOURCE,
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'DEBIT' THEN 'Debit Memo'
+                  WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'CREDIT' THEN 'Credit Memo' 
+                  ELSE NULL END,
+             AIAC.INVOICE_NUM, NVL(AIAC.INVOICE_ID, AIA.INVOICE_ID),
+             NVL(AIAC.INVOICE_NUM, AIA.INVOICE_NUM), NVL(AIAC.INVOICE_DATE, AIA.INVOICE_DATE)
+    HAVING SUM(AID.AMOUNT) <> 0
+
+    UNION ALL
+    -- ========================================================================
+    -- 2.3: PREPAYMENT INVOICES (Unpaid and Partially Paid)
+    -- ========================================================================
+    SELECT /*+ qb_name(AP_PREPAY_INV) */
+           3 NUM
+          ,PPI.INVOICE_ID
+          ,PPI.INVOICE_ID
+          ,PPI.INVOICE_NUM
+          ,NULL
+          ,TO_CHAR(PPI.DOCUMENT_NUM)
+          ,PPI.TRX_SOURCE
+          ,PPI.TRX_TYPE
+          ,PPI.INVOICE_TYPE_LOOKUP_CODE
+          ,PPI.PARTY_ID
+          ,PPI.PARTY_SITE_ID
+          ,PPI.TRX_DESC
+          ,PPI.TRX_DATE
+          ,PPI.GL_DATE
+          ,PPI.CURRENCY_CODE
+          ,PPI.EXCHANGE_RATE_TYPE
+          ,PPI.EXCHANGE_RATE
+          ,PPI.VENDOR_ID
+          ,PPI.VENDOR_SITE_ID
+          ,PPI.ORG_ID
+          ,PPI.PAY_GROUP
+          ,PPI.PO_HEADER_ID
+          ,PPI.ACCTS_PAY_CODE_COMBINATION_ID
+          ,PPI.TOTAL_TAX_AMOUNT
+          ,PPI.INV_AMOUNT
+          ,PPI.VAT_CODE
+          ,PPI.POLICY_NO
+          ,PPI.CLAIM_NO
+          ,PPI.REF_NO
+          ,PPI.CUST_NAME
+          ,PPI.INTERMEDIARY
+          ,PPI.LOB
+          ,PPI.ENTRY_TYPE
+          ,PPI.REINSURER
+          ,PPI.SOURCE
+          ,'Prepayment Invoice Payment'
+          ,NULL
+          ,PPI.INVOICE_ID
+          ,PPI.INVOICE_NUM
+          ,PPI.TRX_DATE
+          ,TO_NUMBER(NULL)
+          ,NVL(PPI.INVOICE_AMOUNT, 0)
+          ,TO_NUMBER(NULL)
+          ,NVL(PPI.ACCT_INVOICE_AMOUNT, 0)
+    FROM   (SELECT AIA.INVOICE_ID
+                  ,AIA.INVOICE_NUM
+                  ,TO_CHAR(AIA.DOC_SEQUENCE_VALUE) DOCUMENT_NUM
+                  ,'Invoice' TRX_SOURCE
+                  ,'Advance' TRX_TYPE
+                  ,AIA.INVOICE_TYPE_LOOKUP_CODE
+                  ,AIA.PARTY_ID
+                  ,AIA.PARTY_SITE_ID
+                  ,AIA.DESCRIPTION TRX_DESC
+                  ,AIA.INVOICE_DATE TRX_DATE
+                  ,MAX(AID.ACCOUNTING_DATE) GL_DATE
+                  ,AIA.INVOICE_CURRENCY_CODE CURRENCY_CODE
+                  ,AIA.EXCHANGE_RATE_TYPE
+                  ,AIA.EXCHANGE_RATE
+                  ,AIA.VENDOR_ID
+                  ,AIA.VENDOR_SITE_ID
+                  ,AIA.ORG_ID
+                  ,FLV.MEANING PAY_GROUP
+                  ,AIA.PO_HEADER_ID
+                  ,AIA.ACCTS_PAY_CODE_COMBINATION_ID
+                  ,AIA.TOTAL_TAX_AMOUNT
+                  ,AIA.INVOICE_AMOUNT INV_AMOUNT
+                  ,(SELECT LISTAGG(AILA.TAX_RATE_CODE, ',') WITHIN GROUP (ORDER BY AILA.INVOICE_ID)
+                    FROM AP_INVOICE_LINES_ALL AILA
+                    WHERE AILA.INVOICE_ID = AIA.INVOICE_ID) VAT_CODE
+                  ,AIA.ATTRIBUTE1 POLICY_NO
+                  ,AIA.ATTRIBUTE2 CLAIM_NO
+                  ,AIA.ATTRIBUTE8 REF_NO
+                  ,AIA.ATTRIBUTE3 CUST_NAME
+                  ,AIA.ATTRIBUTE4 INTERMEDIARY
+                  ,AIA.ATTRIBUTE5 LOB
+                  ,AIA.ATTRIBUTE6 ENTRY_TYPE
+                  ,AIA.ATTRIBUTE13 REINSURER
+                  ,AIA.SOURCE
+                  ,SUM(AID.AMOUNT) INVOICE_AMOUNT
+                  ,SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) ACCT_INVOICE_AMOUNT
+            FROM   AP_INVOICES_ALL AIA
+                  ,AP_INVOICE_DISTRIBUTIONS_ALL AID
+                  ,AP_LOOKUP_CODES ALC
+                  ,FND_LOOKUP_VALUES_VL FLV
+            WHERE  AIA.INVOICE_ID = AID.INVOICE_ID
+              AND  AIA.INVOICE_TYPE_LOOKUP_CODE = ALC.LOOKUP_CODE(+)
+              AND  ALC.LOOKUP_TYPE(+) = 'INVOICE TYPE'
+              AND  AIA.PAY_GROUP_LOOKUP_CODE = FLV.LOOKUP_CODE(+)
+              AND  FLV.LOOKUP_TYPE(+) = 'PAY GROUP'
+              AND  AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT'
+              AND  AIA.INVOICE_ID = AIA.INVOICE_ID + 0
+              AND  AIA.CANCELLED_DATE IS NULL
+            GROUP BY AIA.INVOICE_ID, AIA.INVOICE_NUM, TO_CHAR(AIA.DOC_SEQUENCE_VALUE),
+                     AIA.INVOICE_TYPE_LOOKUP_CODE, AIA.PARTY_ID, AIA.PARTY_SITE_ID,
+                     AIA.DESCRIPTION, AIA.INVOICE_DATE, AIA.INVOICE_CURRENCY_CODE,
+                     AIA.EXCHANGE_RATE_TYPE, AIA.EXCHANGE_RATE, AIA.VENDOR_ID,
+                     AIA.VENDOR_SITE_ID, AIA.ORG_ID, FLV.MEANING, AIA.PO_HEADER_ID,
+                     AIA.ACCTS_PAY_CODE_COMBINATION_ID, AIA.TOTAL_TAX_AMOUNT,
+                     AIA.INVOICE_AMOUNT, AIA.ATTRIBUTE1, AIA.ATTRIBUTE2, AIA.ATTRIBUTE8,
+                     AIA.ATTRIBUTE3, AIA.ATTRIBUTE4, AIA.ATTRIBUTE5, AIA.ATTRIBUTE6,
+                     AIA.ATTRIBUTE13, AIA.SOURCE) PPI
+          ,(SELECT AIP.INVOICE_ID
+                  ,SUM(AIP.AMOUNT_INV_CURR) PAID_AMOUNT
+                  ,SUM(AIP.AMOUNT * NVL(ACA.EXCHANGE_RATE, 1)) ACCT_PAID_AMOUNT
+            FROM   AP_INVOICE_PAYMENTS_ALL AIP
+                  ,AP_CHECKS_ALL ACA
+            WHERE  AIP.CHECK_ID = ACA.CHECK_ID
+              AND  AIP.CHECK_ID = AIP.CHECK_ID + 0
+              AND  ACA.VOID_DATE IS NULL
+            GROUP BY AIP.INVOICE_ID) PPP
+    WHERE  PPI.INVOICE_ID = PPP.INVOICE_ID(+)
+      AND  NVL(PPI.INVOICE_AMOUNT, 0) > NVL(PPP.PAID_AMOUNT, 0)
+
+    UNION ALL
+    -- ========================================================================
+    -- 2.4: PAYMENT TRANSACTIONS
+    -- ========================================================================
+    SELECT /*+ qb_name(AP_PAY) */
+           4 NUM
+          ,ACA.CHECK_ID
+          ,AIP.INVOICE_ID
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN AIA.INVOICE_NUM ELSE NULL END
+          ,TO_CHAR(ACA.CHECK_NUMBER)
+          ,TO_CHAR(ACA.DOC_SEQUENCE_VALUE)
+          ,'Payment'
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN 'Advance' ELSE 'Payment' END
+          ,'Payment'
+          ,ACA.PARTY_ID
+          ,ACA.PARTY_SITE_ID
+          ,ACA.DESCRIPTION
+          ,ACA.CHECK_DATE
+          ,MAX(AIP.ACCOUNTING_DATE)
+          ,ACA.CURRENCY_CODE
+          ,ACA.EXCHANGE_RATE_TYPE
+          ,ACA.EXCHANGE_RATE
+          ,ACA.VENDOR_ID
+          ,ACA.VENDOR_SITE_ID
+          ,ACA.ORG_ID
+          ,FLV.MEANING
+          ,AIA.PO_HEADER_ID
+          ,NULL
+          ,NULL
+          ,ACA.AMOUNT
+          ,NULL
+          ,ACA.ATTRIBUTE1
+          ,ACA.ATTRIBUTE2
+          ,ACA.ATTRIBUTE8
+          ,ACA.ATTRIBUTE3
+          ,ACA.ATTRIBUTE4
+          ,ACA.ATTRIBUTE5
+          ,ACA.ATTRIBUTE6
+          ,ACA.ATTRIBUTE13
+          ,NULL
+          ,'Payment Creation'
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN NULL ELSE AIA.INVOICE_NUM END
+          ,COALESCE(AIC.INVOICE_ID_P, AIA.INVOICE_ID, ACA.CHECK_ID)
+          ,COALESCE(AIC.INVOICE_NUM_P, AIA.INVOICE_NUM, TO_CHAR(ACA.CHECK_NUMBER))
+          ,COALESCE(AIC.INVOICE_DATE_P, AIA.INVOICE_DATE, ACA.CHECK_DATE)
+          ,CASE WHEN (AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT') AND AIC.INVOICE_ID_P IS NOT NULL)
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * AIC.LINE_AMOUNT / AIP.AMOUNT)
+                          ELSE NULL END
+                ELSE CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))
+                          ELSE NULL END END
+          ,CASE WHEN (AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT') AND AIC.INVOICE_ID_P IS NOT NULL)
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * -1 * AIC.LINE_AMOUNT / AIP.AMOUNT)
+                          ELSE NULL END
+                ELSE CASE WHEN (SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1 
+                                AND AIA.INVOICE_TYPE_LOOKUP_CODE <> 'PREPAYMENT')
+                          THEN SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * -1
+                          ELSE NULL END END
+          ,CASE WHEN (AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT') AND AIC.INVOICE_ID_P IS NOT NULL)
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1) * AIC.LINE_AMOUNT / AIP.AMOUNT)
+                          ELSE NULL END
+                ELSE CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1))
+                          ELSE NULL END END
+          ,CASE WHEN (AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT') AND AIC.INVOICE_ID_P IS NOT NULL)
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1) * AIC.LINE_AMOUNT / AIP.AMOUNT) * -1
+                          ELSE NULL END
+                ELSE CASE WHEN (SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1 
+                                AND AIA.INVOICE_TYPE_LOOKUP_CODE <> 'PREPAYMENT')
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1)) * -1
+                          ELSE NULL END END
+    FROM   AP_CHECKS_ALL ACA
+          ,AP_INVOICE_PAYMENTS_ALL AIP
+          ,AP_INVOICES_ALL AIA
+          ,FND_LOOKUP_VALUES_VL FLV
+          ,(SELECT INVOICE_ID, SUM(APP_AMOUNT) APP_AMOUNT
+            FROM PREPAY_TRX GROUP BY INVOICE_ID) PPT
+          ,(SELECT AIL.INVOICE_ID, AIAC.INVOICE_ID INVOICE_ID_P,
+                   AIAC.INVOICE_NUM INVOICE_NUM_P, AIAC.INVOICE_DATE INVOICE_DATE_P,
+                   SUM(AIL.AMOUNT) LINE_AMOUNT
+            FROM AP_INVOICE_LINES_ALL AIL, AP_INVOICES_ALL AIAC
+            WHERE AIL.CORRECTED_INV_ID = AIAC.INVOICE_ID
+            GROUP BY AIL.INVOICE_ID, AIAC.INVOICE_ID, AIAC.INVOICE_NUM, AIAC.INVOICE_DATE
+            HAVING SUM(AIL.AMOUNT) <> 0) AIC
+    WHERE  ACA.CHECK_ID = AIP.CHECK_ID
+      AND  AIP.INVOICE_ID = AIA.INVOICE_ID(+)
+      AND  AIA.PAY_GROUP_LOOKUP_CODE = FLV.LOOKUP_CODE(+)
+      AND  FLV.LOOKUP_TYPE(+) = 'PAY GROUP'
+      AND  AIP.INVOICE_ID = PPT.INVOICE_ID(+)
+      AND  AIA.INVOICE_ID = AIC.INVOICE_ID(+)
+      AND  ACA.VOID_DATE IS NULL
+      AND  ACA.CHECK_ID = ACA.CHECK_ID + 0
+      AND  ((AIA.INVOICE_TYPE_LOOKUP_CODE <> 'PREPAYMENT' AND (NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) <> 0)
+             OR (AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' AND NVL(AIP.AMOUNT, 0) > NVL(PPT.APP_AMOUNT, 0)))
+    GROUP BY ACA.CHECK_ID, AIP.INVOICE_ID,
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN AIA.INVOICE_NUM ELSE NULL END,
+             TO_CHAR(ACA.CHECK_NUMBER), TO_CHAR(ACA.DOC_SEQUENCE_VALUE),
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN 'Advance' ELSE 'Payment' END,
+             ACA.PARTY_ID, ACA.PARTY_SITE_ID, ACA.DESCRIPTION, ACA.CHECK_DATE,
+             ACA.CURRENCY_CODE, ACA.EXCHANGE_RATE_TYPE, ACA.EXCHANGE_RATE,
+             ACA.VENDOR_ID, ACA.VENDOR_SITE_ID, ACA.ORG_ID, FLV.MEANING,
+             AIA.PO_HEADER_ID, ACA.AMOUNT, ACA.ATTRIBUTE1, ACA.ATTRIBUTE2,
+             ACA.ATTRIBUTE8, ACA.ATTRIBUTE3, ACA.ATTRIBUTE4, ACA.ATTRIBUTE5,
+             ACA.ATTRIBUTE6, ACA.ATTRIBUTE13,
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN NULL ELSE AIA.INVOICE_NUM END,
+             COALESCE(AIC.INVOICE_ID_P, AIA.INVOICE_ID, ACA.CHECK_ID),
+             COALESCE(AIC.INVOICE_NUM_P, AIA.INVOICE_NUM, TO_CHAR(ACA.CHECK_NUMBER)),
+             COALESCE(AIC.INVOICE_DATE_P, AIA.INVOICE_DATE, ACA.CHECK_DATE),
+             AIA.INVOICE_TYPE_LOOKUP_CODE, AIC.INVOICE_ID_P
+
+    UNION ALL
+    -- ========================================================================
+    -- 2.5: VOID PAYMENT TRANSACTIONS
+    -- ========================================================================
+    SELECT /*+ qb_name(AP_VOID_PAY) */
+           5 NUM
+          ,ACA.CHECK_ID
+          ,AIP.INVOICE_ID
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN AIA.INVOICE_NUM ELSE NULL END
+          ,TO_CHAR(ACA.CHECK_NUMBER)
+          ,TO_CHAR(ACA.DOC_SEQUENCE_VALUE)
+          ,'Payment'
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN 'Advance' ELSE 'Payment' END
+          ,'Void Payment'
+          ,ACA.PARTY_ID
+          ,ACA.PARTY_SITE_ID
+          ,ACA.DESCRIPTION
+          ,ACA.CHECK_DATE
+          ,MAX(AIP.ACCOUNTING_DATE)
+          ,ACA.CURRENCY_CODE
+          ,ACA.EXCHANGE_RATE_TYPE
+          ,ACA.EXCHANGE_RATE
+          ,ACA.VENDOR_ID
+          ,ACA.VENDOR_SITE_ID
+          ,ACA.ORG_ID
+          ,FLV.MEANING
+          ,AIA.PO_HEADER_ID
+          ,NULL
+          ,NULL
+          ,ACA.AMOUNT
+          ,NULL
+          ,ACA.ATTRIBUTE1
+          ,ACA.ATTRIBUTE2
+          ,ACA.ATTRIBUTE8
+          ,ACA.ATTRIBUTE3
+          ,ACA.ATTRIBUTE4
+          ,ACA.ATTRIBUTE5
+          ,ACA.ATTRIBUTE6
+          ,ACA.ATTRIBUTE13
+          ,NULL
+          ,'Void Payment'
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN NULL ELSE AIA.INVOICE_NUM END
+          ,AIA.INVOICE_ID
+          ,AIA.INVOICE_NUM
+          ,AIA.INVOICE_DATE
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT')
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * AIP.AMOUNT)
+                          ELSE NULL END
+                ELSE CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))
+                          ELSE NULL END END
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT')
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * -1 * AIP.AMOUNT)
+                          ELSE NULL END
+                ELSE CASE WHEN (SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1
+                                AND AIA.INVOICE_TYPE_LOOKUP_CODE <> 'PREPAYMENT')
+                          THEN SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * -1
+                          ELSE NULL END END
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT')
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1) * AIP.AMOUNT)
+                          ELSE NULL END
+                ELSE CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = 1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1))
+                          ELSE NULL END END
+          ,CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE IN ('CREDIT', 'DEBIT')
+                THEN CASE WHEN SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1) * AIP.AMOUNT) * -1
+                          ELSE NULL END
+                ELSE CASE WHEN (SIGN(SUM(NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0))) = -1
+                                AND AIA.INVOICE_TYPE_LOOKUP_CODE <> 'PREPAYMENT')
+                          THEN SUM((NVL(AIP.AMOUNT, 0) - NVL(PPT.APP_AMOUNT, 0)) * NVL(AIP.EXCHANGE_RATE, 1)) * -1
+                          ELSE NULL END END
+    FROM   AP_CHECKS_ALL ACA
+          ,AP_INVOICE_PAYMENTS_ALL AIP
+          ,AP_INVOICES_ALL AIA
+          ,FND_LOOKUP_VALUES_VL FLV
+          ,(SELECT INVOICE_ID, SUM(APP_AMOUNT) APP_AMOUNT
+            FROM PREPAY_TRX GROUP BY INVOICE_ID) PPT
+    WHERE  ACA.CHECK_ID = AIP.CHECK_ID
+      AND  AIP.INVOICE_ID = AIA.INVOICE_ID(+)
+      AND  AIA.PAY_GROUP_LOOKUP_CODE = FLV.LOOKUP_CODE(+)
+      AND  FLV.LOOKUP_TYPE(+) = 'PAY GROUP'
+      AND  AIP.INVOICE_ID = PPT.INVOICE_ID(+)
+      AND  ACA.STATUS_LOOKUP_CODE = 'VOIDED'
+      AND  ACA.CHECK_ID = ACA.CHECK_ID + 0
+    GROUP BY ACA.CHECK_ID, AIP.INVOICE_ID,
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN AIA.INVOICE_NUM ELSE NULL END,
+             TO_CHAR(ACA.CHECK_NUMBER), TO_CHAR(ACA.DOC_SEQUENCE_VALUE),
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN 'Advance' ELSE 'Payment' END,
+             ACA.PARTY_ID, ACA.PARTY_SITE_ID, ACA.DESCRIPTION, ACA.CHECK_DATE,
+             ACA.CURRENCY_CODE, ACA.EXCHANGE_RATE_TYPE, ACA.EXCHANGE_RATE,
+             ACA.VENDOR_ID, ACA.VENDOR_SITE_ID, ACA.ORG_ID, FLV.MEANING,
+             AIA.PO_HEADER_ID, ACA.AMOUNT, ACA.ATTRIBUTE1, ACA.ATTRIBUTE2,
+             ACA.ATTRIBUTE8, ACA.ATTRIBUTE3, ACA.ATTRIBUTE4, ACA.ATTRIBUTE5,
+             ACA.ATTRIBUTE6, ACA.ATTRIBUTE13,
+             CASE WHEN AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT' THEN NULL ELSE AIA.INVOICE_NUM END,
+             AIA.INVOICE_TYPE_LOOKUP_CODE, AIA.INVOICE_ID, AIA.INVOICE_NUM, AIA.INVOICE_DATE
+
+    UNION ALL
+    -- ========================================================================
+    -- 2.6: PREPAYMENT APPLICATION
+    -- ========================================================================
+    SELECT /*+ qb_name(AP_PREPAY_APP) */
+           6 NUM
+          ,AIP.INVOICE_ID
+          ,AIP.INVOICE_ID
+          ,PPT.INVOICE_NUM
+          ,LISTAGG(TO_CHAR(ACA.CHECK_NUMBER), ',') WITHIN GROUP (ORDER BY TO_CHAR(ACA.CHECK_NUMBER))
+          ,LISTAGG(ACA.DOC_SEQUENCE_VALUE, ',') WITHIN GROUP (ORDER BY ACA.DOC_SEQUENCE_VALUE)
+          ,'Payment'
+          ,'Advance'
+          ,'PREPAYMENT'
+          ,ACA.PARTY_ID
+          ,ACA.PARTY_SITE_ID
+          ,PPT.DESCRIPTION
+          ,MAX(ACA.CHECK_DATE)
+          ,MAX(AIP.ACCOUNTING_DATE)
+          ,ACA.CURRENCY_CODE
+          ,ACA.EXCHANGE_RATE_TYPE
+          ,PPT.EXCHANGE_RATE
+          ,ACA.VENDOR_ID
+          ,ACA.VENDOR_SITE_ID
+          ,ACA.ORG_ID
+          ,FLV.MEANING
+          ,PPT.PO_HEADER_ID
+          ,NULL
+          ,NULL
+          ,ACA.AMOUNT
+          ,NULL
+          ,ACA.ATTRIBUTE1
+          ,ACA.ATTRIBUTE2
+          ,ACA.ATTRIBUTE8
+          ,ACA.ATTRIBUTE3
+          ,ACA.ATTRIBUTE4
+          ,ACA.ATTRIBUTE5
+          ,ACA.ATTRIBUTE6
+          ,ACA.ATTRIBUTE13
+          ,NULL
+          ,'Prepayment Application'
+          ,PPT.APP_INVOICE_NUM
+          ,PPT.APP_INVOICE_ID
+          ,PPT.APP_INVOICE_NUM
+          ,PPT.APP_INVOICE_DATE
+          ,PPT.APP_AMOUNT
+          ,TO_NUMBER(NULL)
+          ,PPT.APP_AMOUNT * PPT.APP_EXC_RATE
+          ,TO_NUMBER(NULL)
+    FROM   AP_CHECKS_ALL ACA
+          ,AP_INVOICE_PAYMENTS_ALL AIP
+          ,PREPAY_TRX PPT
+          ,FND_LOOKUP_VALUES_VL FLV
+    WHERE  ACA.CHECK_ID = AIP.CHECK_ID
+      AND  AIP.INVOICE_ID = PPT.INVOICE_ID
+      AND  PPT.PAY_GROUP_CODE = FLV.LOOKUP_CODE(+)
+      AND  FLV.LOOKUP_TYPE(+) = 'PAY GROUP'
+      AND  ACA.CHECK_ID = ACA.CHECK_ID + 0
+      AND  ACA.VOID_DATE IS NULL
+    GROUP BY AIP.INVOICE_ID, PPT.INVOICE_NUM, ACA.PARTY_ID, ACA.PARTY_SITE_ID,
+             PPT.DESCRIPTION, ACA.CURRENCY_CODE, ACA.EXCHANGE_RATE_TYPE,
+             PPT.EXCHANGE_RATE, ACA.VENDOR_ID, ACA.VENDOR_SITE_ID, ACA.ORG_ID,
+             FLV.MEANING, PPT.PO_HEADER_ID, ACA.AMOUNT, ACA.ATTRIBUTE1,
+             ACA.ATTRIBUTE2, ACA.ATTRIBUTE8, ACA.ATTRIBUTE3, ACA.ATTRIBUTE4,
+             ACA.ATTRIBUTE5, ACA.ATTRIBUTE6, ACA.ATTRIBUTE13, PPT.APP_INVOICE_NUM,
+             PPT.APP_INVOICE_ID, PPT.APP_INVOICE_NUM, PPT.APP_INVOICE_DATE,
+             PPT.APP_AMOUNT, PPT.APP_EXC_RATE
+
+    UNION ALL
+    -- ========================================================================
+    -- 2.7: DISCOUNT TRANSACTIONS
+    -- ========================================================================
+    SELECT /*+ qb_name(AP_DISCOUNT) */
+           7 NUM
+          ,ACA.CHECK_ID
+          ,AIP.INVOICE_ID
+          ,NULL
+          ,TO_CHAR(ACA.CHECK_NUMBER)
+          ,TO_CHAR(ACA.DOC_SEQUENCE_VALUE)
+          ,'Payment'
+          ,'Discount'
+          ,'Payment'
+          ,ACA.PARTY_ID
+          ,ACA.PARTY_SITE_ID
+          ,'Discount - ' || ACA.DESCRIPTION
+          ,ACA.CHECK_DATE
+          ,MAX(AIP.ACCOUNTING_DATE)
+          ,GLL.CURRENCY_CODE
+          ,NULL
+          ,TO_NUMBER(NULL)
+          ,ACA.VENDOR_ID
+          ,ACA.VENDOR_SITE_ID
+          ,ACA.ORG_ID
+          ,NULL
+          ,AIA.PO_HEADER_ID
+          ,NULL
+          ,NULL
+          ,ACA.AMOUNT
+          ,NULL
+          ,ACA.ATTRIBUTE1
+          ,ACA.ATTRIBUTE2
+          ,ACA.ATTRIBUTE8
+          ,ACA.ATTRIBUTE3
+          ,ACA.ATTRIBUTE4
+          ,ACA.ATTRIBUTE5
+          ,ACA.ATTRIBUTE6
+          ,ACA.ATTRIBUTE13
+          ,NULL
+          ,'Discount'
+          ,NULL
+          ,ACA.CHECK_ID
+          ,TO_CHAR(ACA.CHECK_NUMBER)
+          ,ACA.CHECK_DATE
+          ,(CASE WHEN SIGN(SUM(AIP.DISCOUNT_TAKEN)) = 1
+                 THEN SUM(ROUND((NVL(AIP.INVOICE_BASE_AMOUNT, AIP.AMOUNT) * AIP.DISCOUNT_TAKEN / AIP.AMOUNT), 2))
+                 ELSE 0 END)
+          ,(CASE WHEN SIGN(SUM(AIP.DISCOUNT_TAKEN)) = -1
+                 THEN SUM(ROUND((NVL(AIP.INVOICE_BASE_AMOUNT, AIP.AMOUNT) * AIP.DISCOUNT_TAKEN / AIP.AMOUNT), 2)) * -1
+                 ELSE 0 END)
+          ,(CASE WHEN SIGN(SUM(AIP.DISCOUNT_TAKEN)) = 1
+                 THEN SUM(ROUND((NVL(AIP.INVOICE_BASE_AMOUNT, AIP.AMOUNT) * AIP.DISCOUNT_TAKEN / AIP.AMOUNT), 2))
+                 ELSE 0 END)
+          ,(CASE WHEN SIGN(SUM(AIP.DISCOUNT_TAKEN)) = -1
+                 THEN SUM(ROUND((NVL(AIP.INVOICE_BASE_AMOUNT, AIP.AMOUNT) * AIP.DISCOUNT_TAKEN / AIP.AMOUNT), 2)) * -1
+                 ELSE 0 END)
+    FROM   AP_CHECKS_ALL ACA
+          ,AP_INVOICE_PAYMENTS_ALL AIP
+          ,AP_INVOICES_ALL AIA
+          ,GL_LEDGERS GLL
+    WHERE  ACA.CHECK_ID = AIP.CHECK_ID
+      AND  ACA.ORG_ID = AIP.ORG_ID
+      AND  AIP.INVOICE_ID = AIA.INVOICE_ID(+)
+      AND  AIP.SET_OF_BOOKS_ID = GLL.LEDGER_ID(+)
+      AND  NVL(AIP.AMOUNT, 0) <> 0
+      AND  AIP.DISCOUNT_TAKEN <> 0
+      AND  ACA.VOID_DATE IS NULL
+      AND  ACA.CHECK_ID = ACA.CHECK_ID + 0
+    GROUP BY ACA.CHECK_ID, AIP.INVOICE_ID, TO_CHAR(ACA.CHECK_NUMBER),
+             TO_CHAR(ACA.DOC_SEQUENCE_VALUE), ACA.PARTY_ID, ACA.PARTY_SITE_ID,
+             ACA.DESCRIPTION, ACA.CHECK_DATE, GLL.CURRENCY_CODE, ACA.VENDOR_ID,
+             ACA.VENDOR_SITE_ID, ACA.ORG_ID, AIA.PO_HEADER_ID, ACA.AMOUNT,
+             ACA.ATTRIBUTE1, ACA.ATTRIBUTE2, ACA.ATTRIBUTE8, ACA.ATTRIBUTE3,
+             ACA.ATTRIBUTE4, ACA.ATTRIBUTE5, ACA.ATTRIBUTE6, ACA.ATTRIBUTE13
+    HAVING SUM(AIP.DISCOUNT_TAKEN) <> 0
+),
+
+-- ============================================================================
+-- BLOCK 3: PERIOD-TO-DATE WITH OPENING BALANCE
+-- ============================================================================
+PTD AS (
+    -- Opening Balance Row (Block 1)
+    SELECT /*+ qb_name(PTD_OPEN) */
+           1 BLOCK
+          ,NULL NUM
+          ,NULL TRX_ID
+          ,NULL VENDOR_ID
+          ,NULL VENDOR_SITE_ID
+          ,NULL INVOICE_NUM
+          ,NULL CHECK_NUM
+          ,NULL DOCUMENT_NUM
+          ,NULL TRX_DATE
+          ,NULL DUE_DATE
+          ,NULL GL_DATE
+          ,NULL TRX_TYPE
+          ,NULL TRX_DESC
+          ,NULL CURRENCY_CODE
+          ,NULL ORG_ID
+          ,NULL POLICY_NO
+          ,NULL CLAIM_NO
+          ,NULL REF_NO
+          ,NULL CUST_NAME
+          ,NULL INTERMEDIARY
+          ,NULL LOB
+          ,NULL ENTRY_TYPE
+          ,NULL REINSURER
+          ,'Opening Balance' DESCRIPTION1
+          ,NULL INV_TYPE
+          ,NULL SOURCE
+          ,NULL INVOICE_NUM_P
+          ,SUM(ROUND(NVL(APT.AMOUNT_DR, 0), 2)) AMOUNT_DR
+          ,SUM(ROUND(NVL(APT.AMOUNT_CR, 0), 2)) AMOUNT_CR
+          ,SUM(ROUND(APT.ACCT_AMOUNT_DR, 2)) ACCT_AMOUNT_DR
+          ,SUM(ROUND(APT.ACCT_AMOUNT_CR, 2)) ACCT_AMOUNT_CR
+          ,NULL ACCT_BALANCE
+          ,SUM(NVL(APT.AMOUNT_CR, 0) - NVL(APT.AMOUNT_DR, 0)) BAL
+          ,NULL BU_NAME
+          ,NULL VENDOR_NUM
+          ,NULL VENDOR_NAME
+          ,NULL VENDOR_SITE_CODE
+          ,NULL ACCOUNT
+          ,NULL VAT_CODE
+          ,NULL TOTAL_TAX_AMOUNT
+          ,NULL INV_AMOUNT
+          ,NULL EX_TAX_AMOUNT
+          ,NULL PARTY_ID
+          ,NULL PARTY_SITE_ID
+          ,NULL ACCTS_PAY_CODE_COMBINATION_ID
+    FROM   AP_TRX APT
+          ,AP_PAYMENT_SCHEDULES_ALL APS
+          ,GL_CODE_COMBINATIONS GCC
+          ,POZ_SUPPLIERS_V POS
+          ,POZ_SUPPLIER_SITES_ALL_M PSS
+          ,FUN_ALL_BUSINESS_UNITS_V FBU
+          ,PARAMS P
+    WHERE  APT.INVOICE_ID = APS.INVOICE_ID(+)
+      AND  APT.ACCTS_PAY_CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID(+)
+      AND  APT.VENDOR_ID = POS.VENDOR_ID(+)
+      AND  APT.VENDOR_SITE_ID = PSS.VENDOR_SITE_ID(+)
+      AND  APT.ORG_ID = FBU.BU_ID(+)
+      AND  APT.GL_DATE < P.P_FROM_DATE
+      AND  APS.DUE_DATE = (SELECT MAX(DUE_DATE) 
+                           FROM AP_PAYMENT_SCHEDULES_ALL 
+                           WHERE INVOICE_ID = APT.INVOICE_ID)
+      AND  (APT.ORG_ID IN (P.P_BU_ID) OR 'All' IN (P.P_BU_ID || 'All'))
+      AND  (POS.SEGMENT1 IN (P.P_SUPPLIER_NUM) OR 'All' IN (P.P_SUPPLIER_NUM || 'All'))
+
+    UNION ALL
+    -- Period Transactions (Block 2)
+    SELECT /*+ qb_name(PTD_TRX) */
+           2 BLOCK
+          ,APT.NUM
+          ,APT.TRX_ID
+          ,APT.VENDOR_ID
+          ,APT.VENDOR_SITE_ID
+          ,APT.INVOICE_NUM
+          ,APT.CHECK_NUM
+          ,APT.DOCUMENT_NUM
+          ,APT.TRX_DATE
+          ,APS.DUE_DATE
+          ,APT.GL_DATE
+          ,APT.TRX_TYPE
+          ,APT.TRX_DESC
+          ,APT.CURRENCY_CODE
+          ,APT.ORG_ID
+          ,APT.POLICY_NO
+          ,APT.CLAIM_NO
+          ,APT.REF_NO
+          ,APT.CUST_NAME
+          ,APT.INTERMEDIARY
+          ,APT.LOB
+          ,APT.ENTRY_TYPE
+          ,APT.REINSURER
+          ,APT.DESCRIPTION1
+          ,APT.INVOICE_TYPE_LOOKUP_CODE
+          ,APT.SOURCE
+          ,APT.INVOICE_NUM_P
+          ,ROUND(NVL(APT.AMOUNT_DR, 0), 2)
+          ,ROUND(NVL(APT.AMOUNT_CR, 0), 2)
+          ,ROUND(APT.ACCT_AMOUNT_DR, 2)
+          ,ROUND(APT.ACCT_AMOUNT_CR, 2)
+          ,CASE WHEN APT.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT'
+                THEN (NVL(APT.ACCT_AMOUNT_CR, 0) - NVL(APT.ACCT_AMOUNT_DR, 0))
+                ELSE SUM(ROUND((NVL(APT.ACCT_AMOUNT_CR, 0) - NVL(APT.ACCT_AMOUNT_DR, 0)), 2))
+                     OVER (PARTITION BY APT.INVOICE_ID_P, APT.INVOICE_NUM_P) END
+          ,NVL(APT.AMOUNT_CR, 0) - NVL(APT.AMOUNT_DR, 0)
+          ,FBU.BU_NAME
+          ,CASE WHEN SIGN(APT.VENDOR_ID) = -1
+                THEN (SELECT DISTINCT PARTY_NUMBER 
+                      FROM HZ_PARTIES 
+                      WHERE APT.PARTY_ID = PARTY_ID)
+                ELSE POS.SEGMENT1 END
+          ,CASE WHEN SIGN(APT.VENDOR_ID) = -1
+                THEN (SELECT DISTINCT PARTY_NAME 
+                      FROM HZ_PARTIES 
+                      WHERE APT.PARTY_ID = PARTY_ID)
+                ELSE POS.VENDOR_NAME END
+          ,CASE WHEN SIGN(APT.VENDOR_ID) = -1
+                THEN (SELECT DISTINCT PARTY_SITE_NAME 
+                      FROM HZ_PARTY_SITES 
+                      WHERE APT.PARTY_SITE_ID = PARTY_SITE_ID)
+                ELSE PSS.VENDOR_SITE_CODE END
+          ,GCC.SEGMENT1 || '-' || GCC.SEGMENT2 || '-' || GCC.SEGMENT3 || '-' || GCC.SEGMENT4 || '-' ||
+           GCC.SEGMENT5 || '-' || GCC.SEGMENT6 || '-' || GCC.SEGMENT7 || '-' || GCC.SEGMENT8
+          ,APT.VAT_CODE
+          ,APT.TOTAL_TAX_AMOUNT
+          ,APT.INV_AMOUNT
+          ,(APT.INV_AMOUNT - NVL(APT.TOTAL_TAX_AMOUNT, 0))
+          ,APT.PARTY_ID
+          ,APT.PARTY_SITE_ID
+          ,APT.ACCTS_PAY_CODE_COMBINATION_ID
+    FROM   AP_TRX APT
+          ,AP_PAYMENT_SCHEDULES_ALL APS
+          ,GL_CODE_COMBINATIONS GCC
+          ,POZ_SUPPLIERS_V POS
+          ,POZ_SUPPLIER_SITES_ALL_M PSS
+          ,FUN_ALL_BUSINESS_UNITS_V FBU
+          ,PARAMS P
+    WHERE  APT.INVOICE_ID = APS.INVOICE_ID(+)
+      AND  APT.ACCTS_PAY_CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID(+)
+      AND  APT.VENDOR_ID = POS.VENDOR_ID(+)
+      AND  APT.VENDOR_SITE_ID = PSS.VENDOR_SITE_ID(+)
+      AND  APT.ORG_ID = FBU.BU_ID(+)
+      AND  APT.GL_DATE BETWEEN P.P_FROM_DATE AND P.P_TO_DATE
+      AND  APS.DUE_DATE = (SELECT MAX(DUE_DATE) 
+                           FROM AP_PAYMENT_SCHEDULES_ALL 
+                           WHERE INVOICE_ID = APT.INVOICE_ID)
+      AND  (APT.ORG_ID IN (P.P_BU_ID) OR 'All' IN (P.P_BU_ID || 'All'))
+      AND  (POS.SEGMENT1 IN (P.P_SUPPLIER_NUM) OR 'All' IN (P.P_SUPPLIER_NUM || 'All'))
+)
+
+-- ============================================================================
+-- FINAL OUTPUT: 30 COLUMNS
+-- ============================================================================
+SELECT /*+ qb_name(FINAL) */
+       PTD.BU_NAME "Business Unit"
+      ,PTD.VENDOR_NUM "Supplier Number"
+      ,PTD.VENDOR_NAME "Supplier Name"
+      ,PTD.VENDOR_SITE_CODE "Supplier Site"
+      ,PTD.SOURCE "Transaction Source"
+      ,GCC.SEGMENT3 "Natural Account"
+      ,PTD.POLICY_NO "Policy No"
+      ,PTD.REF_NO "Reference No"
+      ,PTD.CUST_NAME "Customer Name"
+      ,PTD.INTERMEDIARY "Intermediary Name"
+      ,PTD.LOB
+      ,PTD.ENTRY_TYPE "Entry Type"
+      ,PTD.REINSURER "Reinsurer Name"
+      ,PTD.TRX_ID "Invoice ID"
+      ,PTD.DESCRIPTION1 "Description"
+      ,PTD.INV_TYPE "Invoice Type/ Payment Type"
+      ,NVL(PTD.INVOICE_NUM, PTD.CHECK_NUM) "Invoice Number"
+      ,PTD.DOCUMENT_NUM "Voucher Number"
+      ,PTD.TRX_DESC "Invoice Description"
+      ,PTD.TRX_DATE "Invoice Date"
+      ,PTD.GL_DATE "Transaction Date"
+      ,PTD.CURRENCY_CODE "Currency"
+      ,PTD.VAT_CODE "VAT Code"
+      ,NVL(PTD.EX_TAX_AMOUNT, 0) "Transaction Amount (Exclusive of VAT)"
+      ,NVL(PTD.EX_TAX_AMOUNT, 0) "VAT Supply Amount"
+      ,NVL(PTD.INV_AMOUNT, 0) "Total Invoice Amount"
+      ,PTD.AMOUNT_DR "Entered Debit"
+      ,PTD.AMOUNT_CR "Entered Credit"
+      ,PTD.ACCT_AMOUNT_DR "Accounted Debit"
+      ,PTD.ACCT_AMOUNT_CR "Accounted Credit"
+FROM   PTD, GL_CODE_COMBINATIONS GCC
+WHERE  PTD.ACCTS_PAY_CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID(+)
+ORDER BY PTD.BLOCK, PTD.TRX_DATE, NVL(PTD.INVOICE_NUM, PTD.CHECK_NUM)
+```
+
+### Key Implementation Notes
+
+**1. Standard Filters (No Exceptions)**
+- Invoices: `CANCELLED_DATE IS NULL`
+- Payments: `VOID_DATE IS NULL`
+- Prepayments: `REVERSAL_FLAG = 'N'`
+
+**2. Amount Calculation Logic**
+```sql
+-- Entered DR/CR (transaction currency)
+(CASE WHEN SIGN(SUM(AID.AMOUNT)) = -1 THEN SUM(AID.AMOUNT) * -1 ELSE NULL END) AMOUNT_DR
+(CASE WHEN SIGN(SUM(AID.AMOUNT)) = 1 THEN SUM(AID.AMOUNT) ELSE NULL END) AMOUNT_CR
+
+-- Accounted DR/CR (functional currency)
+(CASE WHEN SIGN(SUM(AID.AMOUNT)) = -1 
+      THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) * -1 ELSE NULL END) ACCT_AMOUNT_DR
+(CASE WHEN SIGN(SUM(AID.AMOUNT)) = 1 
+      THEN SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) ELSE NULL END) ACCT_AMOUNT_CR
+```
+
+**3. VAT Logic**
+```sql
+-- VAT Code: Aggregated from invoice lines
+(SELECT LISTAGG(AILA.TAX_RATE_CODE, ',') WITHIN GROUP (ORDER BY AILA.INVOICE_ID)
+ FROM AP_INVOICE_LINES_ALL AILA
+ WHERE AILA.INVOICE_ID = AIA.INVOICE_ID) VAT_CODE
+
+-- Ex-VAT Amount
+(APT.INV_AMOUNT - NVL(APT.TOTAL_TAX_AMOUNT, 0)) EX_TAX_AMOUNT
+```
+
+**4. Party-Based Supplier Fallback**
+```sql
+-- Supplier Number
+CASE WHEN SIGN(APT.VENDOR_ID) = -1
+     THEN (SELECT PARTY_NUMBER FROM HZ_PARTIES WHERE PARTY_ID = APT.PARTY_ID)
+     ELSE POS.SEGMENT1 END
+
+-- Supplier Name
+CASE WHEN SIGN(APT.VENDOR_ID) = -1
+     THEN (SELECT PARTY_NAME FROM HZ_PARTIES WHERE PARTY_ID = APT.PARTY_ID)
+     ELSE POS.VENDOR_NAME END
+
+-- Supplier Site
+CASE WHEN SIGN(APT.VENDOR_ID) = -1
+     THEN (SELECT PARTY_SITE_NAME FROM HZ_PARTY_SITES WHERE PARTY_SITE_ID = APT.PARTY_SITE_ID)
+     ELSE PSS.VENDOR_SITE_CODE END
+```
+
+**5. DFF Attribute Mapping**
+- Policy No: `ATTRIBUTE1`
+- Claim No: `ATTRIBUTE2` (invoice-specific)
+- Reference No: `ATTRIBUTE8`
+- Customer Name: `ATTRIBUTE3`
+- Intermediary: `ATTRIBUTE4`
+- LOB: `ATTRIBUTE5`
+- Entry Type: `ATTRIBUTE6`
+- Reinsurer: `ATTRIBUTE13`
+
+Available from both `AP_INVOICES_ALL` (invoice transactions) and `AP_CHECKS_ALL` (payment transactions).
+
+**6. Natural Account Source**
+- Uses invoice header liability account: `AP_INVOICES_ALL.ACCTS_PAY_CODE_COMBINATION_ID`
+- Joined to `GL_CODE_COMBINATIONS` to extract `SEGMENT3` (Natural Account per ENV_METADATA.md)
+
+**7. Date Filter**
+- Uses `AP_INVOICE_DISTRIBUTIONS_ALL.ACCOUNTING_DATE` as GL_DATE
+- Opening Balance: `GL_DATE < P_FROM_DATE`
+- Period Transactions: `GL_DATE BETWEEN P_FROM_DATE AND P_TO_DATE`
+
+**8. Index Suppression Pattern**
+```sql
+-- Forces index bypass for better full scan performance on large data sets
+AND AIA.INVOICE_ID = AIA.INVOICE_ID + 0
+AND ACA.CHECK_ID = ACA.CHECK_ID + 0
+```
+
+**9. Payment Allocation Logic**
+- **Prepayment Application Deduction**: Payment amounts reduced by prepayment applications
+- **Credit/Debit Memo Proration**: Payments prorated by line amount for credit/debit invoices
+- **Complex CASE Logic**: Handles different invoice types with appropriate amount allocation
+
+**10. Transaction Type Detection**
+```sql
+-- Prepayment Invoice Payment: Shows unpaid/partially paid prepayments only
+NVL(PPI.INVOICE_AMOUNT, 0) > NVL(PPP.PAID_AMOUNT, 0)
+
+-- Void Payment: Status filter
+ACA.STATUS_LOOKUP_CODE = 'VOIDED'
+
+-- Discount: Separate transaction when discount taken
+AIP.DISCOUNT_TAKEN <> 0
+```
+
+**11. No Semicolon**
+Query ends without semicolon for Oracle Fusion OTBI compatibility.
+
+**12. Validated Reference**
+- Complete working SQL: `.cursor/29-12-25/AP_Ledger_Report.sql`
+- Last validation: 29-12-25
+- All 7 transaction types tested and validated

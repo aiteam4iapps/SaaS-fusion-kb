@@ -1,0 +1,435 @@
+# CM Report Templates
+
+**Purpose:** Ready-to-use SQL skeletons for Cash reporting.
+
+---
+
+## 1. Bank Account List
+*Active internal bank accounts.*
+
+```sql
+/*
+TITLE: Bank Account List
+PURPOSE: Inventory of cash accounts
+*/
+
+WITH
+-- 1. Accounts
+ACCTS AS (
+    SELECT /*+ qb_name(A) MATERIALIZE */
+           CBA.BANK_ACCOUNT_NAME, CBA.CURRENCY_CODE, BB.BANK_NAME
+    FROM   CE_BANK_ACCOUNTS CBA, CE_BANK_BRANCHES_V BB
+    WHERE  CBA.BANK_BRANCH_ID = BB.BRANCH_PARTY_ID
+      AND  NVL(CBA.END_DATE, SYSDATE) >= SYSDATE
+)
+
+-- 2. Final Select
+SELECT A.BANK_NAME
+      ,A.BANK_ACCOUNT_NAME
+      ,A.CURRENCY_CODE
+FROM   ACCTS A
+ORDER BY A.BANK_NAME
+```
+
+---
+
+## 2. Bank Payment Voucher
+*Detailed payment voucher for bank processing.*
+
+```sql
+/*
+TITLE: Bank Payment Voucher
+PURPOSE: Payment voucher with complete details for bank file generation
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+PAYMENT_DATA AS (
+    SELECT /*+ qb_name(PAY_DATA) MATERIALIZE */
+           CBA.BANK_ACCOUNT_NAME
+          ,CBA.BANK_ACCOUNT_NUM
+          ,CBB.BANK_NAME
+          ,CBB.BANK_BRANCH_NAME
+          ,ACA.CHECK_NUMBER PAYMENT_NUMBER
+          ,ACA.CHECK_DATE PAYMENT_DATE
+          ,ACA.AMOUNT PAYMENT_AMOUNT
+          ,ACA.CURRENCY_CODE
+          ,NVL(ACA.EXCHANGE_RATE, 1) EXCHANGE_RATE
+          ,ACA.AMOUNT * NVL(ACA.EXCHANGE_RATE, 1) FUNCTIONAL_AMOUNT
+          -- Amount in Words
+          ,REPLACE(IBY_AMOUNT_IN_WORDS.GET_AMOUNT_IN_WORDS(
+               ROUND(ABS(ACA.AMOUNT * NVL(ACA.EXCHANGE_RATE, 1)), 2),
+               GLL.CURRENCY_CODE), '-', ' ') AMOUNT_IN_WORDS
+          -- Supplier Details
+          ,ACA.VENDOR_NAME
+          ,PSV.SEGMENT1 VENDOR_NUMBER
+          ,ACA.VENDOR_SITE_CODE
+          ,ACA.DESCRIPTION PAYMENT_DESC
+          -- GL Details
+          ,GCC.CONCATENATED_SEGMENTS GL_ACCOUNT
+          -- Payment Instrument
+          ,IPA.PAYMENT_REFERENCE_NUMBER
+          ,IPA.PAYMENT_METHOD_CODE
+          -- Legal Entity
+          ,XLE.NAME LEGAL_ENTITY_NAME
+          ,HAOU.NAME ORG_NAME
+          -- Status
+          ,CASE WHEN APHA.POSTED_FLAG = 'Y' THEN 'ACCOUNTED' ELSE 'UNACCOUNTED' END ACCOUNTING_STATUS
+          ,ACA.STATUS_LOOKUP_CODE PAYMENT_STATUS
+    FROM   AP_CHECKS_ALL ACA
+          ,POZ_SUPPLIERS_V PSV
+          ,IBY_PAYMENTS_ALL IPA
+          ,CE_BANK_ACCOUNTS CBA
+          ,CE_BANK_BRANCHES_V CBB
+          ,GL_CODE_COMBINATIONS_KFV GCC
+          ,HR_OPERATING_UNITS HAOU
+          ,GL_LEDGERS GLL
+          ,XLE_ENTITY_PROFILES XLE
+          ,AP_PAYMENT_HISTORY_ALL APHA
+    WHERE  ACA.VENDOR_ID = PSV.VENDOR_ID(+)
+      AND  ACA.PAYMENT_ID = IPA.PAYMENT_ID
+      AND  IPA.INTERNAL_BANK_ACCOUNT_ID = CBA.BANK_ACCOUNT_ID
+      AND  CBA.BANK_BRANCH_ID = CBB.BRANCH_PARTY_ID
+      AND  CBA.ASSET_CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID
+      AND  ACA.ORG_ID = HAOU.ORGANIZATION_ID
+      AND  HAOU.SET_OF_BOOKS_ID = GLL.LEDGER_ID(+)
+      AND  CBA.ACCOUNT_OWNER_ORG_ID = XLE.LEGAL_ENTITY_ID(+)
+      AND  APHA.CHECK_ID(+) = ACA.CHECK_ID
+      AND  ACA.VOID_DATE IS NULL
+      AND  HAOU.ORGANIZATION_ID = :P_ORG_ID
+      AND  TRUNC(ACA.CHECK_DATE) BETWEEN NVL(:P_FROM_DATE, TRUNC(ACA.CHECK_DATE))
+                                     AND NVL(:P_TO_DATE, TRUNC(ACA.CHECK_DATE))
+      AND  (CBA.BANK_ACCOUNT_NAME IN (:P_BANK_ACCOUNT) OR 'All' IN (:P_BANK_ACCOUNT || 'All'))
+)
+SELECT * FROM PAYMENT_DATA
+ORDER BY PAYMENT_DATE, PAYMENT_NUMBER
+```
+
+---
+
+## 3. Bank Receipt Voucher
+*Detailed receipt voucher for bank processing.*
+
+```sql
+/*
+TITLE: Bank Receipt Voucher
+PURPOSE: Receipt voucher with complete details for bank deposit
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+RECEIPT_DATA AS (
+    SELECT /*+ qb_name(RCPT_DATA) MATERIALIZE */
+           CBA.BANK_ACCOUNT_NAME
+          ,CBA.BANK_ACCOUNT_NUM
+          ,CBB.BANK_NAME
+          ,CBB.BANK_BRANCH_NAME
+          ,ACRA.RECEIPT_NUMBER
+          ,ACRA.RECEIPT_DATE
+          ,ACRA.AMOUNT RECEIPT_AMOUNT
+          ,ACRA.CURRENCY_CODE
+          ,NVL(ACRA.EXCHANGE_RATE, 1) EXCHANGE_RATE
+          ,ACRA.AMOUNT * NVL(ACRA.EXCHANGE_RATE, 1) FUNCTIONAL_AMOUNT
+          -- Customer Details
+          ,HP.PARTY_NAME CUSTOMER_NAME
+          ,HCA.ACCOUNT_NUMBER CUSTOMER_NUMBER
+          ,ACRA.COMMENTS RECEIPT_DESC
+          -- Receipt Method
+          ,ARM.NAME RECEIPT_METHOD
+          -- Deposit Details
+          ,ACRA.DEPOSIT_DATE
+          -- GL Details
+          ,GCC.CONCATENATED_SEGMENTS GL_ACCOUNT
+          -- Status
+          ,ACRH.STATUS RECEIPT_STATUS
+          ,ACRH.STATUS_TRX_NUMBER
+          -- Legal Entity
+          ,XLE.NAME LEGAL_ENTITY_NAME
+    FROM   AR_CASH_RECEIPTS_ALL ACRA
+          ,HZ_CUST_ACCOUNTS HCA
+          ,HZ_PARTIES HP
+          ,AR_RECEIPT_METHODS ARM
+          ,CE_BANK_ACCOUNTS CBA
+          ,CE_BANK_BRANCHES_V CBB
+          ,GL_CODE_COMBINATIONS_KFV GCC
+          ,AR_CASH_RECEIPT_HISTORY_ALL ACRH
+          ,XLE_ENTITY_PROFILES XLE
+    WHERE  ACRA.PAY_FROM_CUSTOMER = HCA.CUST_ACCOUNT_ID(+)
+      AND  HCA.PARTY_ID = HP.PARTY_ID(+)
+      AND  ACRA.RECEIPT_METHOD_ID = ARM.RECEIPT_METHOD_ID(+)
+      AND  ACRA.REMIT_BANK_ACCT_USE_ID = CBA.BANK_ACCOUNT_ID(+)
+      AND  CBA.BANK_BRANCH_ID = CBB.BRANCH_PARTY_ID(+)
+      AND  CBA.ASSET_CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID(+)
+      AND  ACRA.CASH_RECEIPT_ID = ACRH.CASH_RECEIPT_ID
+      AND  ACRH.CURRENT_RECORD_FLAG = 'Y'
+      AND  CBA.ACCOUNT_OWNER_ORG_ID = XLE.LEGAL_ENTITY_ID(+)
+      -- Exclude Reversed Receipts
+      AND  NOT EXISTS (
+           SELECT 1 
+           FROM   AR_CASH_RECEIPT_HISTORY_ALL H
+           WHERE  H.CASH_RECEIPT_ID = ACRA.CASH_RECEIPT_ID
+             AND  H.STATUS = 'REVERSED'
+      )
+      AND  TRUNC(ACRA.RECEIPT_DATE) BETWEEN NVL(:P_FROM_DATE, TRUNC(ACRA.RECEIPT_DATE))
+                                        AND NVL(:P_TO_DATE, TRUNC(ACRA.RECEIPT_DATE))
+      AND  (CBA.BANK_ACCOUNT_NAME IN (:P_BANK_ACCOUNT) OR 'All' IN (:P_BANK_ACCOUNT || 'All'))
+      AND  ACRA.ORG_ID = :P_ORG_ID
+)
+SELECT * FROM RECEIPT_DATA
+ORDER BY RECEIPT_DATE, RECEIPT_NUMBER
+```
+
+---
+
+## 4. Bank Statement Report
+*Complete bank statement with line-by-line details.*
+
+```sql
+/*
+TITLE: Bank Statement Report
+PURPOSE: Detailed bank statement with all transactions
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+STMT_DATA AS (
+    SELECT /*+ qb_name(STMT_DATA) MATERIALIZE */
+           CBA.BANK_ACCOUNT_NAME
+          ,CBA.BANK_ACCOUNT_NUM
+          ,CBB.BANK_NAME
+          ,CBB.BANK_BRANCH_NAME
+          ,CSH.STATEMENT_NUMBER
+          ,CSH.STATEMENT_DATE
+          ,CSH.GL_DATE
+          ,CSH.CONTROL_BEGIN_BALANCE BEGIN_BALANCE
+          ,CSH.CONTROL_END_BALANCE END_BALANCE
+          ,CSH.CONTROL_DR_AMOUNT TOTAL_DEBITS
+          ,CSH.CONTROL_CR_AMOUNT TOTAL_CREDITS
+          ,CSH.CONTROL_LINE_COUNT TOTAL_LINES
+          -- Line Details
+          ,CSL.LINE_NUMBER
+          ,CSL.TRX_DATE
+          ,CSL.EFFECTIVE_DATE
+          ,CSL.TRX_CODE
+          ,CSL.TRX_TEXT
+          ,CSL.BANK_TRX_NUMBER
+          ,CSL.AMOUNT LINE_AMOUNT
+          ,CSL.STATUS RECONCILE_STATUS
+          ,CASE CSL.STATUS
+             WHEN 'RECONCILED' THEN 'Reconciled'
+             WHEN 'UNRECONCILED' THEN 'Unreconciled'
+             WHEN 'EXTERNAL' THEN 'External'
+             ELSE CSL.STATUS
+           END STATUS_DESC
+          -- Running Balance
+          ,CSH.CONTROL_BEGIN_BALANCE + 
+           SUM(CSL.AMOUNT) OVER (PARTITION BY CSH.STATEMENT_HEADER_ID 
+                                 ORDER BY CSL.LINE_NUMBER) RUNNING_BALANCE
+    FROM   CE_STATEMENT_HEADERS CSH
+          ,CE_STATEMENT_LINES CSL
+          ,CE_BANK_ACCOUNTS CBA
+          ,CE_BANK_BRANCHES_V CBB
+    WHERE  CSH.STATEMENT_HEADER_ID = CSL.STATEMENT_HEADER_ID
+      AND  CSH.BANK_ACCOUNT_ID = CBA.BANK_ACCOUNT_ID
+      AND  CBA.BANK_BRANCH_ID = CBB.BRANCH_PARTY_ID
+      AND  CSH.STATEMENT_HEADER_ID IS NOT NULL
+      AND  (CBA.BANK_ACCOUNT_NAME IN (:P_BANK_ACCOUNT) OR 'All' IN (:P_BANK_ACCOUNT || 'All'))
+      AND  TRUNC(CSH.STATEMENT_DATE) BETWEEN NVL(:P_FROM_DATE, TRUNC(CSH.STATEMENT_DATE))
+                                         AND NVL(:P_TO_DATE, TRUNC(CSH.STATEMENT_DATE))
+)
+SELECT * FROM STMT_DATA
+ORDER BY STATEMENT_DATE, STATEMENT_NUMBER, LINE_NUMBER
+```
+
+---
+
+## 5. Bank Statement Reconciliation Report
+*Reconciliation report showing matched and unmatched transactions.*
+
+```sql
+/*
+TITLE: Bank Statement Reconciliation Report
+PURPOSE: Reconciliation analysis with variance tracking
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+RECONCILE_DATA AS (
+    SELECT /*+ qb_name(REC_DATA) MATERIALIZE */
+           CBA.BANK_ACCOUNT_NAME
+          ,CBA.BANK_ACCOUNT_NUM
+          ,CSH.STATEMENT_NUMBER
+          ,CSH.STATEMENT_DATE
+          -- Statement Line
+          ,CSL.LINE_NUMBER STMT_LINE_NUM
+          ,CSL.TRX_DATE STMT_TRX_DATE
+          ,CSL.AMOUNT STMT_AMOUNT
+          ,CSL.TRX_TEXT STMT_DESC
+          ,CSL.STATUS RECONCILE_STATUS
+          -- Reconciliation Details
+          ,CSR.RECONCILIATION_DATE
+          ,CSR.CLEARED_DATE
+          -- Payment/Receipt Details
+          ,CPT.TRX_DATE TRX_DATE
+          ,CPT.AMOUNT TRX_AMOUNT
+          ,CASE CPT.APPLICATION_ID
+             WHEN 200 THEN 'AP Payment'
+             WHEN 222 THEN 'AR Receipt'
+             ELSE 'Other'
+           END SOURCE_MODULE
+          ,CASE CPT.APPLICATION_ID
+             WHEN 200 THEN ACA.CHECK_NUMBER
+             WHEN 222 THEN ACRA.RECEIPT_NUMBER
+             ELSE NULL
+           END TRX_NUMBER
+          ,CASE CPT.APPLICATION_ID
+             WHEN 200 THEN ACA.VENDOR_NAME
+             WHEN 222 THEN HP.PARTY_NAME
+             ELSE NULL
+           END PARTY_NAME
+          -- Variance Analysis
+          ,CSL.AMOUNT - NVL(CPT.AMOUNT, 0) VARIANCE
+          ,CASE 
+             WHEN CSL.STATUS = 'RECONCILED' AND ABS(CSL.AMOUNT - NVL(CPT.AMOUNT, 0)) < 0.01 THEN 'Matched'
+             WHEN CSL.STATUS = 'RECONCILED' AND ABS(CSL.AMOUNT - NVL(CPT.AMOUNT, 0)) >= 0.01 THEN 'Variance'
+             WHEN CSL.STATUS = 'UNRECONCILED' THEN 'Unmatched'
+             ELSE 'Unknown'
+           END MATCH_STATUS
+    FROM   CE_STATEMENT_HEADERS CSH
+          ,CE_STATEMENT_LINES CSL
+          ,CE_STATEMENT_RECONCILS_ALL CSR
+          ,CE_PAYMENT_TRANSACTIONS CPT
+          ,CE_BANK_ACCOUNTS CBA
+          ,AP_CHECKS_ALL ACA
+          ,AR_CASH_RECEIPTS_ALL ACRA
+          ,HZ_CUST_ACCOUNTS HCA
+          ,HZ_PARTIES HP
+    WHERE  CSH.STATEMENT_HEADER_ID = CSL.STATEMENT_HEADER_ID
+      AND  CSL.STATEMENT_LINE_ID = CSR.STATEMENT_LINE_ID(+)
+      AND  CSR.REFERENCE_ID = CPT.PAYMENT_TRANSACTION_ID(+)
+      AND  CSR.REFERENCE_TYPE(+) = 'PAYMENT'
+      AND  CSH.BANK_ACCOUNT_ID = CBA.BANK_ACCOUNT_ID
+      AND  CPT.SOURCE_TRX_ID = ACA.CHECK_ID(+)
+      AND  CPT.SOURCE_TRX_ID = ACRA.CASH_RECEIPT_ID(+)
+      AND  ACRA.PAY_FROM_CUSTOMER = HCA.CUST_ACCOUNT_ID(+)
+      AND  HCA.PARTY_ID = HP.PARTY_ID(+)
+      AND  (CBA.BANK_ACCOUNT_NAME IN (:P_BANK_ACCOUNT) OR 'All' IN (:P_BANK_ACCOUNT || 'All'))
+      AND  TRUNC(CSH.STATEMENT_DATE) BETWEEN NVL(:P_FROM_DATE, TRUNC(CSH.STATEMENT_DATE))
+                                         AND NVL(:P_TO_DATE, TRUNC(CSH.STATEMENT_DATE))
+)
+SELECT * FROM RECONCILE_DATA
+ORDER BY STATEMENT_DATE, STATEMENT_NUMBER, STMT_LINE_NUM
+```
+
+---
+
+## 6. Cash Management Details Report
+*Comprehensive cash analysis with all inflows and outflows.*
+
+```sql
+/*
+TITLE: Cash Management Details Report
+PURPOSE: Complete cash flow analysis with payments and receipts
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Opening Balance
+OPENING_BAL AS (
+    SELECT /*+ qb_name(OPEN_BAL) */
+           CBA.BANK_ACCOUNT_ID
+          ,CBA.BANK_ACCOUNT_NAME
+          ,SUM(CASE WHEN CPT.TRX_DATE < :P_FROM_DATE 
+                    THEN CASE WHEN CPT.APPLICATION_ID = 222 THEN CPT.AMOUNT 
+                              ELSE CPT.AMOUNT * -1 END 
+                    ELSE 0 END) OPENING_BALANCE
+    FROM   CE_BANK_ACCOUNTS CBA
+          ,CE_PAYMENT_TRANSACTIONS CPT
+    WHERE  CBA.BANK_ACCOUNT_ID = CPT.BANK_ACCOUNT_ID(+)
+    GROUP BY CBA.BANK_ACCOUNT_ID, CBA.BANK_ACCOUNT_NAME
+),
+-- Cash Transactions
+CASH_TRX AS (
+    -- Payments (Outflows)
+    SELECT 1 SORT_ORDER
+          ,CPT.BANK_ACCOUNT_ID
+          ,CPT.TRX_DATE
+          ,'Payment' TRX_TYPE
+          ,ACA.CHECK_NUMBER TRX_NUMBER
+          ,ACA.VENDOR_NAME PARTY_NAME
+          ,ACA.DESCRIPTION TRX_DESC
+          ,CPT.AMOUNT * -1 AMOUNT -- Negative for outflow
+          ,CPT.CURRENCY_CODE
+          ,CPT.GL_DATE
+          ,CPT.RECONCILE_FLAG
+    FROM   CE_PAYMENT_TRANSACTIONS CPT
+          ,AP_CHECKS_ALL ACA
+    WHERE  CPT.SOURCE_TRX_ID = ACA.CHECK_ID(+)
+      AND  CPT.APPLICATION_ID = 200
+      AND  ACA.VOID_DATE IS NULL
+      AND  TRUNC(CPT.TRX_DATE) BETWEEN :P_FROM_DATE AND :P_TO_DATE
+    
+    UNION ALL
+    
+    -- Receipts (Inflows)
+    SELECT 2 SORT_ORDER
+          ,CPT.BANK_ACCOUNT_ID
+          ,CPT.TRX_DATE
+          ,'Receipt' TRX_TYPE
+          ,ACRA.RECEIPT_NUMBER
+          ,HP.PARTY_NAME
+          ,ACRA.COMMENTS
+          ,CPT.AMOUNT AMOUNT -- Positive for inflow
+          ,CPT.CURRENCY_CODE
+          ,CPT.GL_DATE
+          ,CPT.RECONCILE_FLAG
+    FROM   CE_PAYMENT_TRANSACTIONS CPT
+          ,AR_CASH_RECEIPTS_ALL ACRA
+          ,HZ_CUST_ACCOUNTS HCA
+          ,HZ_PARTIES HP
+    WHERE  CPT.SOURCE_TRX_ID = ACRA.CASH_RECEIPT_ID(+)
+      AND  CPT.APPLICATION_ID = 222
+      AND  ACRA.PAY_FROM_CUSTOMER = HCA.CUST_ACCOUNT_ID(+)
+      AND  HCA.PARTY_ID = HP.PARTY_NAME(+)
+      -- Exclude Reversed Receipts
+      AND  NOT EXISTS (
+           SELECT 1 
+           FROM   AR_CASH_RECEIPT_HISTORY_ALL H
+           WHERE  H.CASH_RECEIPT_ID = ACRA.CASH_RECEIPT_ID
+             AND  H.STATUS = 'REVERSED'
+      )
+      AND  TRUNC(CPT.TRX_DATE) BETWEEN :P_FROM_DATE AND :P_TO_DATE
+)
+-- Final Selection with Running Balance
+SELECT CBA.BANK_ACCOUNT_NAME
+      ,CBA.BANK_ACCOUNT_NUM
+      ,CBB.BANK_NAME
+      ,OB.OPENING_BALANCE
+      ,CT.TRX_DATE
+      ,CT.TRX_TYPE
+      ,CT.TRX_NUMBER
+      ,CT.PARTY_NAME
+      ,CT.TRX_DESC
+      ,CT.AMOUNT
+      ,CT.CURRENCY_CODE
+      ,CT.GL_DATE
+      ,CT.RECONCILE_FLAG
+      -- Running Balance
+      ,NVL(OB.OPENING_BALANCE, 0) + 
+       SUM(CT.AMOUNT) OVER (PARTITION BY CBA.BANK_ACCOUNT_ID 
+                           ORDER BY CT.TRX_DATE, CT.SORT_ORDER) RUNNING_BALANCE
+FROM   CASH_TRX CT
+      ,CE_BANK_ACCOUNTS CBA
+      ,CE_BANK_BRANCHES_V CBB
+      ,OPENING_BAL OB
+WHERE  CT.BANK_ACCOUNT_ID = CBA.BANK_ACCOUNT_ID
+  AND  CBA.BANK_BRANCH_ID = CBB.BRANCH_PARTY_ID
+  AND  CBA.BANK_ACCOUNT_ID = OB.BANK_ACCOUNT_ID(+)
+  AND  (CBA.BANK_ACCOUNT_NAME IN (:P_BANK_ACCOUNT) OR 'All' IN (:P_BANK_ACCOUNT || 'All'))
+ORDER BY CBA.BANK_ACCOUNT_NAME, CT.TRX_DATE, CT.SORT_ORDER
+```

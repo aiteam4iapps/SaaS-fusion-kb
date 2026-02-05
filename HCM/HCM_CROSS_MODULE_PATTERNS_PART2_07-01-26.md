@@ -1,0 +1,1578 @@
+# HCM Cross-Module Patterns - Part 2: Advanced Integration
+
+**Date:** 07-Jan-2026  
+**Purpose:** Advanced cross-module integration patterns  
+**Status:** Production-Ready
+
+---
+
+## 📋 TABLE OF CONTENTS
+
+1. [Timesheet with Project Integration](#timesheet-with-project-integration)
+2. [Missing Punch Detection](#missing-punch-detection)
+3. [Absence Integration in Timesheet](#absence-integration-in-timesheet)
+4. [Cost Allocation Patterns](#cost-allocation-patterns)
+5. [Dependent Management](#dependent-management)
+6. [Document of Record Patterns](#document-of-record-patterns)
+7. [Role-Based Security](#role-based-security)
+8. [Workflow Approval Tracking](#workflow-approval-tracking)
+
+---
+
+## 🕐 1. TIMESHEET WITH PROJECT INTEGRATION
+
+### Complete Timesheet Query (Project + Absence + Public Holiday)
+
+**Problem:** Comprehensive timesheet showing all time types
+
+**Solution:**
+
+```sql
+-- PART 1: Actual timecard data
+SELECT
+    PAPF.PERSON_NUMBER,
+    PPNF.DISPLAY_NAME EMPLOYEE_NAME,
+    TMH.TM_REC_GRP_ID,
+    TO_CHAR(TMH.START_TIME, 'DD-MON-YYYY') WEEK_START,
+    TO_CHAR(TMH.STOP_TIME, 'DD-MON-YYYY') WEEK_END,
+    TMH.STATUS TIMECARD_STATUS,
+    TMH.RECORDED_HOURS,
+    
+    TO_CHAR(TMD.START_TIME, 'YYYY-MM-DD') DAY_DATE,
+    
+    -- Project details (from HWM_TM_REP_ATRB_USAGES)
+    (SELECT PJP.SEGMENT1
+     FROM
+         HWM_TM_REP_ATRB_USAGES AUSG,
+         HWM_TM_REP_ATRBS ATR,
+         PJF_PROJECTS_ALL_VL PJP
+     WHERE
+         TMD.TM_REC_ID = AUSG.USAGES_SOURCE_ID
+         AND AUSG.TM_REP_ATRB_ID = ATR.TM_REP_ATRB_ID
+         AND ATR.ATTRIBUTE_CATEGORY = 'Projects'
+         AND ATR.ATTRIBUTE_NUMBER1 = PJP.PROJECT_ID
+         
+         -- Latest version
+         AND AUSG.USAGES_SOURCE_VERSION = (
+             SELECT MAX(A1.USAGES_SOURCE_VERSION)
+             FROM HWM_TM_REP_ATRB_USAGES A1
+             WHERE A1.USAGES_SOURCE_ID = TMD.TM_REC_ID
+         )
+         AND ROWNUM = 1
+    ) PROJECT,
+    
+    (SELECT PJP.NAME
+     FROM
+         HWM_TM_REP_ATRB_USAGES AUSG,
+         HWM_TM_REP_ATRBS ATR,
+         PJF_PROJECTS_ALL_VL PJP
+     WHERE
+         TMD.TM_REC_ID = AUSG.USAGES_SOURCE_ID
+         AND AUSG.TM_REP_ATRB_ID = ATR.TM_REP_ATRB_ID
+         AND ATR.ATTRIBUTE_CATEGORY = 'Projects'
+         AND ATR.ATTRIBUTE_NUMBER1 = PJP.PROJECT_ID
+         AND AUSG.USAGES_SOURCE_VERSION = (
+             SELECT MAX(A1.USAGES_SOURCE_VERSION)
+             FROM HWM_TM_REP_ATRB_USAGES A1
+             WHERE A1.USAGES_SOURCE_ID = TMD.TM_REC_ID
+         )
+         AND ROWNUM = 1
+    ) PROJECT_NAME,
+    
+    -- Task details
+    (SELECT PJT.TASK_NUMBER
+     FROM
+         HWM_TM_REP_ATRB_USAGES AUSG,
+         HWM_TM_REP_ATRBS ATR,
+         PJF_TASKS_V PJT
+     WHERE
+         TMD.TM_REC_ID = AUSG.USAGES_SOURCE_ID
+         AND AUSG.TM_REP_ATRB_ID = ATR.TM_REP_ATRB_ID
+         AND ATR.ATTRIBUTE_CATEGORY = 'Projects'
+         AND ATR.ATTRIBUTE_NUMBER2 = PJT.TASK_ID
+         AND AUSG.USAGES_SOURCE_VERSION = (
+             SELECT MAX(A1.USAGES_SOURCE_VERSION)
+             FROM HWM_TM_REP_ATRB_USAGES A1
+             WHERE A1.USAGES_SOURCE_ID = TMD.TM_REC_ID
+         )
+         AND ROWNUM = 1
+    ) TASK,
+    
+    -- Expenditure type (Project) OR Absence type
+    NVL(
+        (SELECT D.EXPENDITURE_TYPE_NAME
+         FROM
+             HWM_TM_REP_ATRB_USAGES B,
+             HWM_TM_REP_ATRBS C,
+             PJF_EXP_TYPES_TL D
+         WHERE
+             TMD.TM_REC_ID = B.USAGES_SOURCE_ID
+             AND B.TM_REP_ATRB_ID = C.TM_REP_ATRB_ID
+             AND C.ATTRIBUTE_CATEGORY = TO_CHAR(D.EXPENDITURE_TYPE_ID)
+             AND D.LANGUAGE = 'US'
+             AND B.USAGES_SOURCE_VERSION = (
+                 SELECT MAX(A1.USAGES_SOURCE_VERSION)
+                 FROM HWM_TM_REP_ATRB_USAGES A1
+                 WHERE A1.USAGES_SOURCE_ID = TMD.TM_REC_ID
+             )
+             AND ROWNUM = 1
+        ),
+        (SELECT D.NAME
+         FROM
+             HWM_TM_REP_ATRB_USAGES B,
+             HWM_TM_REP_ATRBS C,
+             ANC_ABSENCE_TYPES_VL D
+         WHERE
+             TMD.TM_REC_ID = B.USAGES_SOURCE_ID
+             AND B.TM_REP_ATRB_ID = C.TM_REP_ATRB_ID
+             AND C.ATTRIBUTE_CATEGORY = TO_CHAR(D.ABSENCE_TYPE_ID)
+             AND D.LANGUAGE = 'US'
+             AND B.USAGES_SOURCE_VERSION = (
+                 SELECT MAX(A1.USAGES_SOURCE_VERSION)
+                 FROM HWM_TM_REP_ATRB_USAGES A1
+                 WHERE A1.USAGES_SOURCE_ID = TMD.TM_REC_ID
+             )
+             AND ROWNUM = 1
+        )
+    ) EXPENDITURE_TYPE,
+    
+    -- Approver (Task Manager OR Project Manager OR Line Manager)
+    NVL(
+        NVL(
+            -- Try task manager first
+            (SELECT P1.DISPLAY_NAME
+             FROM
+                 HWM_TM_REP_ATRB_USAGES AUSG,
+                 HWM_TM_REP_ATRBS ATR,
+                 PJF_TASKS_V PJT,
+                 PER_PERSON_NAMES_F P1
+             WHERE
+                 TMD.TM_REC_ID = AUSG.USAGES_SOURCE_ID
+                 AND AUSG.TM_REP_ATRB_ID = ATR.TM_REP_ATRB_ID
+                 AND ATR.ATTRIBUTE_CATEGORY = 'Projects'
+                 AND ATR.ATTRIBUTE_NUMBER2 = PJT.TASK_ID
+                 AND PJT.TASK_MANAGER_PERSON_ID = P1.PERSON_ID
+                 AND P1.PERSON_ID <> PAPF.PERSON_ID
+                 AND P1.NAME_TYPE = 'GLOBAL'
+                 AND TRUNC(TMD.START_TIME) BETWEEN P1.EFFECTIVE_START_DATE AND P1.EFFECTIVE_END_DATE
+                 AND AUSG.USAGES_SOURCE_VERSION = (
+                     SELECT MAX(A1.USAGES_SOURCE_VERSION)
+                     FROM HWM_TM_REP_ATRB_USAGES A1
+                     WHERE A1.USAGES_SOURCE_ID = TMD.TM_REC_ID
+                 )
+                 AND ROWNUM = 1
+            ),
+            -- Fallback to project manager
+            (SELECT P1.DISPLAY_NAME
+             FROM
+                 PJF_PROJECT_PARTIES PPP,
+                 PJF_PROJ_ROLE_TYPES_TL PPR,
+                 PER_PERSON_NAMES_F P1,
+                 HWM_TM_REP_ATRB_USAGES AUSG,
+                 HWM_TM_REP_ATRBS ATR
+             WHERE
+                 PPP.PROJECT_ROLE_ID = PPR.PROJECT_ROLE_ID
+                 AND PPP.RESOURCE_SOURCE_ID = P1.PERSON_ID
+                 AND TMD.TM_REC_ID = AUSG.USAGES_SOURCE_ID
+                 AND AUSG.TM_REP_ATRB_ID = ATR.TM_REP_ATRB_ID
+                 AND ATR.ATTRIBUTE_NUMBER1 = PPP.PROJECT_ID
+                 AND P1.PERSON_ID <> PAPF.PERSON_ID
+                 AND ATR.ATTRIBUTE_CATEGORY = 'Projects'
+                 AND PPR.LANGUAGE = 'US'
+                 AND PPR.PROJECT_ROLE_NAME = 'Project Manager'
+                 AND P1.NAME_TYPE = 'GLOBAL'
+                 AND TRUNC(TMD.START_TIME) BETWEEN PPP.START_DATE_ACTIVE AND NVL(PPP.END_DATE_ACTIVE, TRUNC(TMD.START_TIME))
+                 AND TRUNC(TMD.START_TIME) BETWEEN P1.EFFECTIVE_START_DATE AND P1.EFFECTIVE_END_DATE
+                 AND AUSG.USAGES_SOURCE_VERSION = (
+                     SELECT MAX(A1.USAGES_SOURCE_VERSION)
+                     FROM HWM_TM_REP_ATRB_USAGES A1
+                     WHERE A1.USAGES_SOURCE_ID = TMD.TM_REC_ID
+                 )
+                 AND ROWNUM = 1
+            )
+        ),
+        -- Final fallback to line manager (if not project time)
+        CASE WHEN TMH.STATUS IN ('Approved', 'Submitted') THEN
+            (SELECT A1.DISPLAY_NAME
+             FROM
+                 PER_PERSON_NAMES_F A1,
+                 PER_ALL_ASSIGNMENTS_M A2,
+                 PER_ASSIGNMENT_SUPERVISORS_F A3
+             WHERE
+                 A1.PERSON_ID = A2.PERSON_ID
+                 AND A2.ASSIGNMENT_ID = A3.MANAGER_ASSIGNMENT_ID
+                 AND A3.ASSIGNMENT_ID = ASG.ASSIGNMENT_ID
+                 AND A2.PRIMARY_FLAG = 'Y'
+                 AND A2.EFFECTIVE_LATEST_CHANGE = 'Y'
+                 AND A2.ASSIGNMENT_STATUS_TYPE = 'ACTIVE'
+                 AND A3.MANAGER_TYPE = 'LINE_MANAGER'
+                 AND A1.NAME_TYPE = 'GLOBAL'
+                 AND TRUNC(TMD.START_TIME) BETWEEN A2.EFFECTIVE_START_DATE AND A2.EFFECTIVE_END_DATE
+                 AND TRUNC(TMD.START_TIME) BETWEEN A3.EFFECTIVE_START_DATE AND A3.EFFECTIVE_END_DATE
+                 AND TRUNC(TMD.START_TIME) BETWEEN A1.EFFECTIVE_START_DATE AND A1.EFFECTIVE_END_DATE
+                 AND ROWNUM = 1
+            )
+        END
+    ) APPROVER,
+    
+    TO_CHAR(CASE WHEN TMH.STATUS = 'Approved' THEN TMH.LAST_UPDATE_DATE END, 'DD-MON-YYYY') APPROVAL_DATE,
+    TO_CHAR(TMH.SUBMISSION_DATE, 'DD-MON-YYYY') SUBMISSION_DATE
+    
+FROM
+    PER_ALL_PEOPLE_F PAPF,
+    PER_PERSON_NAMES_F PPNF,
+    PER_ALL_ASSIGNMENTS_M ASG,
+    HWM_EXT_TIMECARD_DETAIL_V TMD,
+    HWM_TM_REC_GRP_SUM_V TMH
+WHERE
+    PAPF.PERSON_ID = PPNF.PERSON_ID
+    AND PAPF.PERSON_ID = ASG.PERSON_ID
+    AND PAPF.PERSON_ID = TMD.RESOURCE_ID
+    AND PAPF.PERSON_ID = TMH.RESOURCE_ID
+    
+    AND ASG.ASSIGNMENT_TYPE IN ('E', 'C')
+    AND ASG.PRIMARY_FLAG = 'Y'
+    AND ASG.EFFECTIVE_LATEST_CHANGE = 'Y'
+    AND ASG.ASSIGNMENT_STATUS_TYPE = 'ACTIVE'
+    
+    AND PPNF.NAME_TYPE = 'GLOBAL'
+    
+    AND TMD.GRP_TYPE_NAME IN ('TimecardDay', 'Absences Entry')
+    AND TMD.LAYER_CODE IN ('TIME_RPTD', 'ABSENCES')
+    
+    AND TRUNC(TMD.START_TIME) BETWEEN TRUNC(TMH.START_TIME) AND TRUNC(TMH.STOP_TIME)
+    
+    AND TRUNC(TMD.START_TIME) BETWEEN :P_FROM_DATE AND :P_TO_DATE
+    
+    AND TRUNC(TMD.START_TIME) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    AND TRUNC(TMD.START_TIME) BETWEEN PPNF.EFFECTIVE_START_DATE AND PPNF.EFFECTIVE_END_DATE
+    AND TRUNC(TMD.START_TIME) BETWEEN ASG.EFFECTIVE_START_DATE AND ASG.EFFECTIVE_END_DATE
+
+UNION
+
+-- PART 2: Public holidays (no timecard)
+SELECT
+    PAPF.PERSON_NUMBER,
+    PPNF.DISPLAY_NAME EMPLOYEE_NAME,
+    NULL TM_REC_GRP_ID,
+    NULL WEEK_START,
+    NULL WEEK_END,
+    NULL TIMECARD_STATUS,
+    NULL RECORDED_HOURS,
+    
+    TO_CHAR(SCH.START_DATE_TIME, 'YYYY-MM-DD') DAY_DATE,
+    NULL PROJECT,
+    NULL PROJECT_NAME,
+    NULL TASK,
+    NULL EXPENDITURE_TYPE,
+    SCH.OBJECT_NAME PUBLIC_HOLIDAY,
+    NULL APPROVER,
+    NULL APPROVAL_DATE,
+    NULL SUBMISSION_DATE
+    
+FROM
+    PER_ALL_PEOPLE_F PAPF,
+    PER_PERSON_NAMES_F PPNF,
+    PER_ALL_ASSIGNMENTS_M ASG,
+    TABLE(PER_AVAILABILITY_DETAILS.GET_SCHEDULE_DETAILS(
+        P_RESOURCE_TYPE => 'ASSIGN',
+        P_RESOURCE_ID => ASG.ASSIGNMENT_ID,
+        P_PERIOD_START => TO_DATE(:P_FROM_DATE, 'YYYY-MM-DD'),
+        P_PERIOD_END => TO_DATE(:P_TO_DATE, 'YYYY-MM-DD') + 1
+    )) SCH
+WHERE
+    PAPF.PERSON_ID = PPNF.PERSON_ID
+    AND PAPF.PERSON_ID = ASG.PERSON_ID
+    
+    AND PPNF.NAME_TYPE = 'GLOBAL'
+    AND ASG.ASSIGNMENT_TYPE IN ('E', 'C')
+    AND ASG.PRIMARY_FLAG = 'Y'
+    AND ASG.EFFECTIVE_LATEST_CHANGE = 'Y'
+    AND ASG.ASSIGNMENT_STATUS_TYPE = 'ACTIVE'
+    
+    -- Public holiday category
+    AND SCH.OBJECT_CATEGORY = 'PH'
+    
+    -- No timecard exists
+    AND NOT EXISTS (
+        SELECT 1
+        FROM HWM_EXT_TIMECARD_DETAIL_V TMD
+        WHERE TMD.RESOURCE_ID = PAPF.PERSON_ID
+        AND TMD.GRP_TYPE_NAME IN ('TimecardDay', 'Absences Entry')
+        AND TMD.LAYER_CODE IN ('TIME_RPTD', 'ABSENCES')
+        AND TRUNC(TMD.START_TIME) = TRUNC(SCH.START_DATE_TIME)
+    )
+    
+    AND TRUNC(SCH.START_DATE_TIME) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    AND TRUNC(SCH.START_DATE_TIME) BETWEEN PPNF.EFFECTIVE_START_DATE AND PPNF.EFFECTIVE_END_DATE
+    AND TRUNC(SCH.START_DATE_TIME) BETWEEN ASG.EFFECTIVE_START_DATE AND ASG.EFFECTIVE_END_DATE
+
+UNION
+
+-- PART 3: Schedule exceptions (missing timecard, not public holiday)
+SELECT
+    PAPF.PERSON_NUMBER,
+    PPNF.DISPLAY_NAME EMPLOYEE_NAME,
+    NULL TM_REC_GRP_ID,
+    NULL WEEK_START,
+    NULL WEEK_END,
+    NULL TIMECARD_STATUS,
+    NULL RECORDED_HOURS,
+    
+    TO_CHAR(PRE.START_DATE_TIME, 'YYYY-MM-DD') DAY_DATE,
+    NULL PROJECT,
+    NULL PROJECT_NAME,
+    NULL TASK,
+    NULL EXPENDITURE_TYPE,
+    PRE.EXCEPTION_NAME,  -- Schedule exception
+    NULL APPROVER,
+    NULL APPROVAL_DATE,
+    NULL SUBMISSION_DATE
+    
+FROM
+    PER_ALL_ASSIGNMENTS_F ASG,
+    PER_ALL_PEOPLE_F PAPF,
+    PER_PERSON_NAMES_F PPNF,
+    PER_SCHEDULE_ASSIGNMENTS PSA,
+    ZMM_SR_SCHEDULES_VL ZS,
+    PER_SCHEDULE_EXCEPTIONS PSE,
+    PER_RESOURCE_EXCEPTIONS PRE
+WHERE
+    ASG.PERSON_ID = PAPF.PERSON_ID
+    AND ASG.PERSON_ID = PPNF.PERSON_ID
+    AND ASG.ASSIGNMENT_ID = PSA.RESOURCE_ID
+    AND PSA.SCHEDULE_ID = ZS.SCHEDULE_ID
+    AND PSA.SCHEDULE_ASSIGNMENT_ID = PSE.SCHEDULE_ASSIGNMENT_ID
+    AND PSE.EXCEPTION_ID = PRE.EXCEPTION_ID
+    
+    AND ASG.ASSIGNMENT_STATUS_TYPE = 'ACTIVE'
+    AND ASG.ASSIGNMENT_TYPE IN ('E', 'C')
+    AND ASG.PRIMARY_FLAG = 'Y'
+    AND PPNF.NAME_TYPE = 'GLOBAL'
+    AND PSA.RESOURCE_TYPE = 'ASSIGN'
+    
+    -- No timecard exists
+    AND NOT EXISTS (
+        SELECT 1
+        FROM HWM_EXT_TIMECARD_DETAIL_V TMD
+        WHERE TMD.RESOURCE_ID = PAPF.PERSON_ID
+        AND TMD.GRP_TYPE_NAME IN ('TimecardDay', 'Absences Entry')
+        AND TMD.LAYER_CODE IN ('TIME_RPTD', 'ABSENCES')
+        AND TRUNC(TMD.START_TIME) = TRUNC(PRE.START_DATE_TIME)
+    )
+    
+    -- Not a public holiday
+    AND NOT EXISTS (
+        SELECT 1
+        FROM TABLE(PER_AVAILABILITY_DETAILS.GET_SCHEDULE_DETAILS(
+            P_RESOURCE_TYPE => 'ASSIGN',
+            P_RESOURCE_ID => ASG.ASSIGNMENT_ID,
+            P_PERIOD_START => TRUNC(PRE.START_DATE_TIME),
+            P_PERIOD_END => TRUNC(PRE.START_DATE_TIME) + 1
+        )) SCH
+        WHERE SCH.OBJECT_CATEGORY = 'PH'
+    )
+    
+    AND TRUNC(PRE.START_DATE_TIME) BETWEEN :P_FROM_DATE AND :P_TO_DATE
+    
+    AND TRUNC(PRE.START_DATE_TIME) BETWEEN ASG.EFFECTIVE_START_DATE AND ASG.EFFECTIVE_END_DATE
+    AND TRUNC(PRE.START_DATE_TIME) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    AND TRUNC(PRE.START_DATE_TIME) BETWEEN PPNF.EFFECTIVE_START_DATE AND PPNF.EFFECTIVE_END_DATE
+    AND TRUNC(PRE.START_DATE_TIME) BETWEEN PSA.START_DATE AND PSA.END_DATE
+    AND TRUNC(PRE.START_DATE_TIME) BETWEEN ZS.EFFECTIVE_FROM_DATE AND ZS.EFFECTIVE_TO_DATE
+
+ORDER BY PERSON_NUMBER, DAY_DATE
+```
+
+**Key Pattern:** Use UNION to combine:
+1. Actual timecard data (with project details)
+2. Public holidays (where no timecard)
+3. Schedule exceptions (missing timecard, not holiday)
+
+---
+
+## 🚨 2. MISSING PUNCH DETECTION
+
+### Pattern 2.1: Missing IN or OUT Punch
+
+**Problem:** Detect employees who punched in but not out (or vice versa)
+
+**Solution:**
+
+```sql
+WITH WORKING_TIME AS (
+    SELECT
+        HTR.RESOURCE_ID,
+        HTR.START_TIME TE_START_TIME,
+        HTR.STOP_TIME TE_STOP_TIME,
+        TRUNC(DTRG.START_TIME) DAY_START_TIME
+    FROM
+        HWM_TM_REC HTR,
+        HWM_TM_REC_GRP_USAGES HTRGU,
+        HWM_TM_REC_GRP DTRG,
+        HWM_TM_REC_GRP DTRG1,
+        HWM_TM_D_TM_UI_STATUS_V HTDTUSV
+    WHERE
+        HTRGU.TM_REC_GRP_ID = DTRG.TM_REC_GRP_ID
+        AND HTRGU.TM_REC_GRP_VERSION = DTRG.TM_REC_GRP_VERSION
+        AND DTRG.PARENT_TM_REC_GRP_ID = DTRG1.TM_REC_GRP_ID
+        AND DTRG.PARENT_TM_REC_GRP_VERSION = DTRG1.TM_REC_GRP_VERSION
+        AND HTR.TM_REC_ID = HTRGU.TM_REC_ID
+        AND HTR.TM_REC_VERSION = HTRGU.TM_REC_VERSION
+        AND DTRG1.TM_REC_GRP_ID = HTDTUSV.TM_BLDG_BLK_ID
+        
+        -- Filters
+        AND UPPER(HTR.UNIT_OF_MEASURE) IN ('UN', 'HR')
+        AND DTRG1.GRP_TYPE_ID = 100
+        AND NVL(HTR.LATEST_VERSION, 'Y') = 'Y'
+        AND HTR.RESOURCE_TYPE = 'PERSON'
+        AND HTR.LATEST_VERSION = 'Y'
+        AND HTR.DELETE_FLAG IS NULL
+        AND HTR.LAYER_CODE = 'TIME_RPTD'
+        
+        -- Latest status
+        AND (HTDTUSV.TM_BLDG_BLK_VERSION, HTDTUSV.STATUS_ID) = (
+            SELECT MAX(TM_BLDG_BLK_VERSION), MAX(STATUS_ID)
+            FROM HWM_TM_D_TM_UI_STATUS_V
+            WHERE TM_BLDG_BLK_ID = HTDTUSV.TM_BLDG_BLK_ID
+        )
+        
+        -- Latest creation date
+        AND HTR.CREATION_DATE = (
+            SELECT MAX(HTR1.CREATION_DATE)
+            FROM
+                HWM_TM_REC HTR1,
+                HWM_TM_REC_GRP_USAGES HTRGU1,
+                HWM_TM_REC_GRP DTRG1
+            WHERE
+                HTRGU1.TM_REC_GRP_ID = DTRG1.TM_REC_GRP_ID
+                AND HTRGU1.TM_REC_GRP_VERSION = DTRG1.TM_REC_GRP_VERSION
+                AND HTR1.TM_REC_ID = HTRGU1.TM_REC_ID
+                AND HTR1.TM_REC_VERSION = HTRGU1.TM_REC_VERSION
+                AND HTR1.RESOURCE_ID = HTR.RESOURCE_ID
+                AND DTRG1.TM_REC_GRP_ID = DTRG.TM_REC_GRP_ID
+                AND HTR1.LAYER_CODE = 'TIME_RPTD'
+                AND HTR1.DELETE_FLAG IS NULL
+        )
+        
+        AND TRUNC(DTRG.START_TIME) = TRUNC(:P_CALENDAR_DATE)
+),
+SHIFT_DETAILS AS (
+    SELECT
+        ZSST.SCHEDULE_ID,
+        TRUNC(ZSSTD.START_DATE_TIME) CALENDAR_DATE
+    FROM
+        ZMM_SR_SCHEDULES_TL ZSST,
+        ZMM_SR_SCHEDULE_DTLS ZSSTD,
+        ZMM_SR_SHIFTS_VL ZSSV
+    WHERE
+        ZSST.SCHEDULE_ID = ZSSTD.SCHEDULE_ID
+        AND ZSST.LANGUAGE = 'US'
+        AND ZSSTD.SHIFT_ID = ZSSV.SHIFT_ID
+        AND ZSSV.DELETED_FLAG = 'N'
+        AND TRUNC(ZSSTD.START_DATE_TIME) = TRUNC(:P_CALENDAR_DATE)
+)
+SELECT
+    PAPF.PERSON_NUMBER,
+    PPNF.DISPLAY_NAME,
+    PPNF1.DISPLAY_NAME ARABIC_NAME,
+    POS.NAME POSITION,
+    PG.NAME GRADE,
+    ORG.NAME DEPARTMENT,
+    
+    -- Missing punch indicators
+    CASE WHEN WT.TE_START_TIME IS NULL THEN 'NOT AVAILABLE' ELSE NULL END PUNCH_IN,
+    CASE WHEN WT.TE_STOP_TIME IS NULL THEN 'NOT AVAILABLE' ELSE NULL END PUNCH_OUT,
+    
+    -- Manager and contact
+    MGR.FULL_NAME MGR_NAME,
+    PEA.EMAIL_ADDRESS EMP_EMAIL,
+    PEA1.EMAIL_ADDRESS MGR_EMAIL
+    
+FROM
+    PER_ALL_PEOPLE_F PAPF,
+    PER_PERSON_NAMES_F PPNF,
+    PER_PERSON_NAMES_F PPNF1,
+    PER_ALL_ASSIGNMENTS_F PAAF,
+    PER_SCHEDULE_ASSIGNMENTS PSA,
+    SHIFT_DETAILS SHIFT,
+    WORKING_TIME WT,
+    PER_GRADES PG,
+    HR_ALL_POSITIONS HAP,
+    PER_DEPARTMENTS ORG,
+    PER_ASSIGNMENT_SUPERVISORS_F PASF,
+    PER_PERSON_NAMES_F MGR,
+    PER_EMAIL_ADDRESSES PEA,
+    PER_EMAIL_ADDRESSES PEA1
+WHERE
+    PAPF.PERSON_ID = PPNF.PERSON_ID
+    AND PAPF.PERSON_ID = PPNF1.PERSON_ID
+    AND PAPF.PERSON_ID = PAAF.PERSON_ID
+    AND PAAF.ASSIGNMENT_ID = PSA.RESOURCE_ID
+    AND PSA.SCHEDULE_ID = SHIFT.SCHEDULE_ID
+    
+    AND PAPF.PERSON_ID = WT.RESOURCE_ID
+    AND PAAF.ASSIGNMENT_ID = WT.TE_SUBRESOURCE_ID
+    
+    AND PAAF.GRADE_ID = PG.GRADE_ID(+)
+    AND PAAF.POSITION_ID = HAP.POSITION_ID(+)
+    AND PAAF.ORGANIZATION_ID = ORG.ORGANIZATION_ID(+)
+    
+    AND PAAF.ASSIGNMENT_ID = PASF.ASSIGNMENT_ID(+)
+    AND PASF.MANAGER_ID = MGR.PERSON_ID(+)
+    AND MGR.NAME_TYPE(+) = 'GLOBAL'
+    
+    AND PAAF.PERSON_ID = PEA.PERSON_ID(+)
+    AND PASF.MANAGER_ID = PEA1.PERSON_ID(+)
+    AND PEA.EMAIL_TYPE(+) = 'W1'
+    AND PEA1.EMAIL_TYPE(+) = 'W1'
+    
+    AND PPNF.NAME_TYPE = 'GLOBAL'
+    AND PPNF1.NAME_TYPE = 'AE'
+    AND PSA.PRIMARY_FLAG = 'Y'
+    AND PSA.RESOURCE_TYPE = 'ASSIGN'
+    AND PAAF.ASSIGNMENT_TYPE = 'E'
+    AND PAAF.PRIMARY_ASSIGNMENT_FLAG = 'Y'
+    
+    -- Missing punch condition
+    AND (WT.TE_START_TIME IS NULL OR WT.TE_STOP_TIME IS NULL)
+    
+    -- Get latest supervisor record
+    AND PASF.EFFECTIVE_START_DATE = (
+        SELECT MAX(S.EFFECTIVE_START_DATE)
+        FROM PER_ASSIGNMENT_SUPERVISORS_F S
+        WHERE S.ASSIGNMENT_ID = PASF.ASSIGNMENT_ID
+    )
+    
+    AND TRUNC(PAAF.EFFECTIVE_START_DATE) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    AND TRUNC(PAAF.EFFECTIVE_START_DATE) BETWEEN PPNF.EFFECTIVE_START_DATE AND PPNF.EFFECTIVE_END_DATE
+    AND TRUNC(PAAF.EFFECTIVE_START_DATE) BETWEEN PPNF1.EFFECTIVE_START_DATE AND PPNF1.EFFECTIVE_END_DATE
+    
+ORDER BY PERSON_NUMBER
+```
+
+**Key Logic:**
+- Check `TE_START_TIME IS NULL` → Missing punch in
+- Check `TE_STOP_TIME IS NULL` → Missing punch out
+- Exclude public holidays
+- Exclude if no schedule for that day
+
+---
+
+## 📝 3. ABSENCE INTEGRATION IN TIMESHEET
+
+### Pattern 3.1: Absence Status in Timesheet Line
+
+**Problem:** Show absence approval status in timesheet report
+
+**Solution:**
+
+```sql
+SELECT
+    TMD.TM_REC_ID,
+    TMD.START_TIME,
+    
+    -- Get expenditure type or absence type
+    EXPENDITURE_TYPE,
+    
+    -- Absence count
+    (SELECT COUNT(*)
+     FROM HWM_EXT_TIMECARD_DETAIL_V HET
+     WHERE HET.LAYER_CODE = 'ABSENCES'
+     AND HET.TM_REC_ID = TMD.TM_REC_ID
+     AND HET.RESOURCE_ID = TMD.RESOURCE_ID
+    ) ABS_COUNT,
+    
+    -- Line status (absence approval status)
+    CASE
+        -- If has project
+        WHEN PROJECT IS NOT NULL THEN
+            NVL(LINE_STATUS1, STATUS)  -- Use project status
+        
+        -- If has absence
+        WHEN ABS_COUNT > 0 THEN
+            (SELECT
+                 CASE
+                     WHEN ABSE.ABSENCE_STATUS_CD = 'SUBMITTED' AND ABSE.APPROVAL_STATUS_CD = 'APPROVED'
+                     THEN 'Approved'
+                     
+                     WHEN ABSE.ABSENCE_STATUS_CD = 'ORA_WITHDRAWN' AND ABSE.APPROVAL_STATUS_CD = 'ORA_AWAIT_AWAIT'
+                     THEN 'Approved'
+                     
+                     WHEN ABSE.ABSENCE_STATUS_CD = 'SUBMITTED' AND ABSE.APPROVAL_STATUS_CD = 'AWAITING'
+                     THEN 'Submitted'
+                     
+                     WHEN ABSE.ABSENCE_STATUS_CD = 'SAVED'
+                     THEN 'Saved'
+                     
+                     ELSE NULL
+                 END
+             FROM
+                 ANC_PER_ABS_ENTRIES ABSE,
+                 ANC_ABSENCE_TYPES_F_TL ABST
+             WHERE
+                 ABSE.ABSENCE_TYPE_ID = ABST.ABSENCE_TYPE_ID
+                 AND ABSE.PERSON_ID = TMD.RESOURCE_ID
+                 AND ABST.LANGUAGE = 'US'
+                 
+                 -- Status filter
+                 AND (
+                     (ABSE.ABSENCE_STATUS_CD = 'SUBMITTED' AND ABSE.APPROVAL_STATUS_CD = 'APPROVED')
+                     OR (ABSE.ABSENCE_STATUS_CD = 'ORA_WITHDRAWN' AND ABSE.APPROVAL_STATUS_CD = 'ORA_AWAIT_AWAIT')
+                     OR (ABSE.ABSENCE_STATUS_CD = 'SUBMITTED' AND ABSE.APPROVAL_STATUS_CD = 'AWAITING')
+                     OR (ABSE.ABSENCE_STATUS_CD = 'SAVED')
+                 )
+                 
+                 -- Date match
+                 AND TRUNC(TMD.START_TIME) BETWEEN TRUNC(ABST.EFFECTIVE_START_DATE) AND TRUNC(ABST.EFFECTIVE_END_DATE)
+                 AND TRUNC(TMD.START_TIME) BETWEEN TRUNC(ABSE.START_DATE) AND TRUNC(ABSE.END_DATE)
+                 AND UPPER(ABST.NAME) = UPPER(EXPENDITURE_TYPE)
+                 AND ROWNUM = 1
+            )
+        
+        ELSE STATUS
+    END LINE_STATUS
+    
+FROM HWM_EXT_TIMECARD_DETAIL_V TMD
+```
+
+**Absence Status Combinations:**
+
+| ABSENCE_STATUS_CD | APPROVAL_STATUS_CD | Display Status |
+|-------------------|-------------------|----------------|
+| SUBMITTED | APPROVED | Approved |
+| ORA_WITHDRAWN | ORA_AWAIT_AWAIT | Approved (withdrawn after approval) |
+| SUBMITTED | AWAITING | Submitted (pending approval) |
+| SAVED | (any) | Saved (draft) |
+
+---
+
+## 💰 4. COST ALLOCATION PATTERNS
+
+### Pattern 4.1: Department Cost Center Mapping
+
+**Problem:** Get cost center segments for department
+
+**Solution:**
+
+```sql
+WITH COST_ALLOCATION AS (
+    SELECT
+        PCAA.SEGMENT1 COMPANY_CODE,
+        PCAA.SEGMENT2 COST_CODE,
+        PCAA.SEGMENT3 LOC_CODE,
+        
+        -- Get descriptions from flex values
+        (SELECT FFVV.DESCRIPTION
+         FROM FND_FLEX_VALUES_VL FFVV
+         WHERE FFVV.FLEX_VALUE = PCAA.SEGMENT1
+         AND FFVV.VALUE_CATEGORY = 'EPG Company'
+        ) COMPANY_DESC,
+        
+        (SELECT FFVV.DESCRIPTION
+         FROM FND_FLEX_VALUES_VL FFVV
+         WHERE FFVV.FLEX_VALUE = PCAA.SEGMENT2
+         AND FFVV.VALUE_CATEGORY = 'EPG Cost Center'
+        ) COST_DESC,
+        
+        (SELECT FFVV.DESCRIPTION
+         FROM FND_FLEX_VALUES_VL FFVV
+         WHERE FFVV.FLEX_VALUE = PCAA.SEGMENT3
+         AND FFVV.VALUE_CATEGORY = 'EPG Location'
+        ) LOC_DESC,
+        
+        PCAF.SOURCE_ID  -- Organization ID
+        
+    FROM
+        PAY_COST_ALLOC_ACCOUNTS PCAA,
+        PAY_COST_ALLOCATIONS_F PCAF
+    WHERE
+        PCAA.COST_ALLOCATION_RECORD_ID = PCAF.COST_ALLOCATION_RECORD_ID
+        AND PCAA.SOURCE_SUB_TYPE = 'COST'
+        AND PCAF.SOURCE_TYPE = 'ORG'
+        
+        AND TRUNC(SYSDATE) BETWEEN PCAF.EFFECTIVE_START_DATE AND PCAF.EFFECTIVE_END_DATE
+)
+SELECT
+    PAPF.PERSON_NUMBER,
+    ORG.NAME DEPARTMENT,
+    
+    -- Cost center details
+    CA.COMPANY_CODE,
+    CA.COST_CODE,
+    CA.LOC_CODE,
+    CA.COMPANY_DESC,
+    CA.COST_DESC,
+    CA.LOC_DESC
+    
+FROM
+    PER_ALL_PEOPLE_F PAPF,
+    PER_ALL_ASSIGNMENTS_M PAAF,
+    HR_ALL_ORGANIZATION_UNITS_F HAOUF,
+    COST_ALLOCATION CA
+WHERE
+    PAPF.PERSON_ID = PAAF.PERSON_ID
+    AND PAAF.ORGANIZATION_ID = HAOUF.ORGANIZATION_ID
+    AND HAOUF.ORGANIZATION_ID = CA.SOURCE_ID(+)
+    
+    AND PAAF.ASSIGNMENT_TYPE = 'E'
+    AND PAAF.PRIMARY_FLAG = 'Y'
+    AND PAAF.EFFECTIVE_LATEST_CHANGE = 'Y'
+    
+    AND TRUNC(SYSDATE) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    AND TRUNC(SYSDATE) BETWEEN PAAF.EFFECTIVE_START_DATE AND PAAF.EFFECTIVE_END_DATE
+    AND TRUNC(SYSDATE) BETWEEN HAOUF.EFFECTIVE_START_DATE AND HAOUF.EFFECTIVE_END_DATE
+```
+
+---
+
+## 👨‍👩‍👧‍👦 5. DEPENDENT MANAGEMENT
+
+### Pattern 5.1: Airfare Entitlement by Dependents
+
+**Problem:** Calculate airfare allowance based on dependents' ages
+
+**Solution:**
+
+```sql
+WITH DEPENDENT_AIRFARE AS (
+    SELECT
+        PAPF.PERSON_ID,
+        PAPF.PERSON_NUMBER,
+        
+        -- Count by age category
+        SUM(CASE 
+            WHEN TRUNC(MONTHS_BETWEEN(SYSDATE, PP.DATE_OF_BIRTH) / 12) < 2 
+            THEN 1 ELSE 0 
+        END) INFANT_COUNT,
+        
+        SUM(CASE 
+            WHEN TRUNC(MONTHS_BETWEEN(SYSDATE, PP.DATE_OF_BIRTH) / 12) BETWEEN 2 AND 11 
+            THEN 1 ELSE 0 
+        END) CHILD_COUNT,
+        
+        SUM(CASE 
+            WHEN TRUNC(MONTHS_BETWEEN(SYSDATE, PP.DATE_OF_BIRTH) / 12) > 11 
+            THEN 1 ELSE 0 
+        END) ADULT_DEPENDENT_COUNT,
+        
+        -- Spouse count
+        SUM(CASE 
+            WHEN PCRF.CONTACT_TYPE = 'S' 
+            THEN 1 ELSE 0 
+        END) SPOUSE_COUNT
+        
+    FROM
+        PER_ALL_PEOPLE_F PAPF,
+        PER_CONTACT_RELSHIPS_F PCRF,
+        PER_PERSONS PP
+    WHERE
+        PAPF.PERSON_ID = PCRF.PERSON_ID
+        AND PCRF.CONTACT_PERSON_ID = PP.PERSON_ID
+        AND PCRF.CONTACT_TYPE IN ('C', 'IN_D', 'IN_S', 'S')  -- Children + Spouse
+        AND PCRF.CONT_ATTRIBUTE1 = 'Y'  -- Airfare eligible
+        
+        AND TRUNC(SYSDATE) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+        AND TRUNC(SYSDATE) BETWEEN PCRF.EFFECTIVE_START_DATE AND PCRF.EFFECTIVE_END_DATE
+        
+    GROUP BY PAPF.PERSON_ID, PAPF.PERSON_NUMBER
+),
+UDT_RATES AS (
+    SELECT
+        FUTV.BASE_USER_TABLE_NAME,
+        FUCV.BASE_USER_COLUMN_NAME AIRFARE_CLASS,
+        FURV.ROW_NAME DESTINATION,
+        REPLACE(FUCIF.VALUE, ',', '') RATE,
+        FUCIF.LEGISLATIVE_DATA_GROUP_ID
+    FROM
+        FF_USER_TABLES_VL FUTV,
+        FF_USER_COLUMNS_VL FUCV,
+        FF_USER_ROWS_VL FURV,
+        FF_USER_COLUMN_INSTANCES_F FUCIF
+    WHERE
+        FUTV.BASE_USER_TABLE_NAME IN ('AIRFARE_ALLOWANCE_ADULT', 
+                                      'AIRFARE_ALLOWANCE_CHILD', 
+                                      'AIRFARE_ALLOWANCE_INFANT')
+        AND FUCV.BASE_USER_COLUMN_NAME IN ('ECONOMY', 'BUSINESS')
+        AND FUTV.USER_TABLE_ID = FUCV.USER_TABLE_ID
+        AND FUTV.USER_TABLE_ID = FURV.USER_TABLE_ID
+        AND FUCV.USER_COLUMN_ID = FUCIF.USER_COLUMN_ID
+        AND FURV.USER_ROW_ID = FUCIF.USER_ROW_ID
+        AND TRUNC(SYSDATE) BETWEEN FUCIF.EFFECTIVE_START_DATE AND FUCIF.EFFECTIVE_END_DATE
+)
+SELECT
+    PAPF.PERSON_NUMBER,
+    PPNF.DISPLAY_NAME,
+    
+    -- Dependent counts
+    DEP.INFANT_COUNT,
+    DEP.CHILD_COUNT,
+    DEP.ADULT_DEPENDENT_COUNT,
+    DEP.SPOUSE_COUNT,
+    
+    -- Assignment airfare details
+    PAAF.ASS_ATTRIBUTE1 DESTINATION,
+    DECODE(PAAF.ASS_ATTRIBUTE_CATEGORY, 'Economy Class', 'ECONOMY', 'Business Class', 'BUSINESS') CLASS,
+    
+    -- Self (employee)
+    CASE WHEN PAAF.ASS_ATTRIBUTE2 = 'Y' THEN 1 ELSE 0 END SELF_ELIGIBLE,
+    
+    -- UDT rates
+    ADULT_RATE.RATE ADULT_RATE,
+    CHILD_RATE.RATE CHILD_RATE,
+    INFANT_RATE.RATE INFANT_RATE,
+    
+    -- Calculated airfare
+    (CASE WHEN PAAF.ASS_ATTRIBUTE2 = 'Y' THEN 1 ELSE 0 END * TO_NUMBER(ADULT_RATE.RATE)) SELF_AIRFARE,
+    (DEP.SPOUSE_COUNT * TO_NUMBER(ADULT_RATE.RATE)) SPOUSE_AIRFARE,
+    (DEP.ADULT_DEPENDENT_COUNT * TO_NUMBER(ADULT_RATE.RATE)) ADULT_DEP_AIRFARE,
+    (DEP.CHILD_COUNT * TO_NUMBER(CHILD_RATE.RATE)) CHILD_AIRFARE,
+    (DEP.INFANT_COUNT * TO_NUMBER(INFANT_RATE.RATE)) INFANT_AIRFARE,
+    
+    -- Total annual airfare
+    ((CASE WHEN PAAF.ASS_ATTRIBUTE2 = 'Y' THEN 1 ELSE 0 END * TO_NUMBER(ADULT_RATE.RATE)) +
+     (DEP.SPOUSE_COUNT * TO_NUMBER(ADULT_RATE.RATE)) +
+     (DEP.ADULT_DEPENDENT_COUNT * TO_NUMBER(ADULT_RATE.RATE)) +
+     (DEP.CHILD_COUNT * TO_NUMBER(CHILD_RATE.RATE)) +
+     (DEP.INFANT_COUNT * TO_NUMBER(INFANT_RATE.RATE))) TOTAL_AIRFARE_ANNUAL
+    
+FROM
+    PER_ALL_PEOPLE_F PAPF,
+    PER_PERSON_NAMES_F PPNF,
+    PER_ALL_ASSIGNMENTS_F PAAF,
+    DEPENDENT_AIRFARE DEP,
+    PAY_PAY_RELATIONSHIPS_DN PPRD,
+    UDT_RATES ADULT_RATE,
+    UDT_RATES CHILD_RATE,
+    UDT_RATES INFANT_RATE
+WHERE
+    PAPF.PERSON_ID = PPNF.PERSON_ID
+    AND PAPF.PERSON_ID = PAAF.PERSON_ID
+    AND PAPF.PERSON_ID = DEP.PERSON_ID(+)
+    AND PAAF.PERSON_ID = PPRD.PERSON_ID
+    
+    -- Match UDT rates
+    AND UPPER(PAAF.ASS_ATTRIBUTE1) = UPPER(ADULT_RATE.ROW_NAME(+))
+    AND PAAF.CLASS = ADULT_RATE.AIRFARE_CLASS(+)
+    AND PAAF.LEGISLATIVE_DATA_GROUP_ID = ADULT_RATE.LEGISLATIVE_DATA_GROUP_ID(+)
+    AND ADULT_RATE.BASE_USER_TABLE_NAME(+) = 'AIRFARE_ALLOWANCE_ADULT'
+    
+    AND UPPER(PAAF.ASS_ATTRIBUTE1) = UPPER(CHILD_RATE.ROW_NAME(+))
+    AND PAAF.CLASS = CHILD_RATE.AIRFARE_CLASS(+)
+    AND PAAF.LEGISLATIVE_DATA_GROUP_ID = CHILD_RATE.LEGISLATIVE_DATA_GROUP_ID(+)
+    AND CHILD_RATE.BASE_USER_TABLE_NAME(+) = 'AIRFARE_ALLOWANCE_CHILD'
+    
+    AND UPPER(PAAF.ASS_ATTRIBUTE1) = UPPER(INFANT_RATE.ROW_NAME(+))
+    AND PAAF.CLASS = INFANT_RATE.AIRFARE_CLASS(+)
+    AND PAAF.LEGISLATIVE_DATA_GROUP_ID = INFANT_RATE.LEGISLATIVE_DATA_GROUP_ID(+)
+    AND INFANT_RATE.BASE_USER_TABLE_NAME(+) = 'AIRFARE_ALLOWANCE_INFANT'
+    
+    AND PPNF.NAME_TYPE = 'GLOBAL'
+    AND PAAF.ASSIGNMENT_TYPE = 'E'
+    AND PAAF.PRIMARY_ASSIGNMENT_FLAG = 'Y'
+    
+    AND TRUNC(SYSDATE) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    AND TRUNC(SYSDATE) BETWEEN PPNF.EFFECTIVE_START_DATE AND PPNF.EFFECTIVE_END_DATE
+    AND TRUNC(SYSDATE) BETWEEN PAAF.EFFECTIVE_START_DATE AND PAAF.EFFECTIVE_END_DATE
+```
+
+**Key Flexfields:**
+- `ASS_ATTRIBUTE1` - Destination
+- `ASS_ATTRIBUTE2` - Self eligible (Y/N)
+- `ASS_ATTRIBUTE_CATEGORY` - Airfare class
+- `CONT_ATTRIBUTE1` - Dependent airfare eligible (Y/N)
+- `CONT_ATTRIBUTE3` - Child education levy eligible
+
+---
+
+## 📄 6. DOCUMENT OF RECORD PATTERNS
+
+### Pattern 6.1: Latest Document (Passport/Visa)
+
+**Problem:** Get latest passport or visa from HR_DOCUMENTS_OF_RECORD
+
+**Solution:**
+
+```sql
+SELECT
+    PAPF.PERSON_NUMBER,
+    
+    -- Passport (prefer PER_PASSPORTS, fallback to HR_DOCUMENTS_OF_RECORD)
+    NVL(
+        (SELECT PASS.PASSPORT_NUMBER
+         FROM PER_PASSPORTS PASS
+         WHERE PASS.PERSON_ID = PAPF.PERSON_ID
+         AND :P_EFFECTIVE_DATE BETWEEN NVL(PASS.ISSUE_DATE, :P_EFFECTIVE_DATE) 
+                                  AND NVL(PASS.EXPIRATION_DATE, :P_EFFECTIVE_DATE)
+         AND ROWNUM = 1
+        ),
+        (SELECT HR.DEI_ATTRIBUTE1
+         FROM
+             HR_DOCUMENTS_OF_RECORD HR,
+             HR_DOCUMENT_TYPES_TL HRT
+         WHERE
+             HR.DOCUMENT_TYPE_ID = HRT.DOCUMENT_TYPE_ID
+             AND HRT.LANGUAGE = 'US'
+             AND HRT.DOCUMENT_TYPE = 'Passport'
+             AND HR.PERSON_ID = PAPF.PERSON_ID
+             
+             -- Latest document (by DATE_TO)
+             AND TRUNC(NVL(HR.DATE_TO, SYSDATE)) = (
+                 SELECT TRUNC(NVL(MAX(HR1.DATE_TO), SYSDATE))
+                 FROM HR_DOCUMENTS_OF_RECORD HR1
+                 WHERE HR1.PERSON_ID = HR.PERSON_ID
+                 AND HR1.DOCUMENT_TYPE_ID = HR.DOCUMENT_TYPE_ID
+             )
+             AND ROWNUM = 1
+        )
+    ) PASSPORT_NUMBER,
+    
+    -- Passport expiry
+    NVL(
+        (SELECT TO_CHAR(PASS.EXPIRATION_DATE, 'DD-MON-YYYY')
+         FROM PER_PASSPORTS PASS
+         WHERE PASS.PERSON_ID = PAPF.PERSON_ID
+         AND :P_EFFECTIVE_DATE BETWEEN NVL(PASS.ISSUE_DATE, :P_EFFECTIVE_DATE) 
+                                  AND NVL(PASS.EXPIRATION_DATE, :P_EFFECTIVE_DATE)
+         AND ROWNUM = 1
+        ),
+        (SELECT TO_CHAR(MAX(HR.DATE_TO), 'DD-MON-YYYY')
+         FROM
+             HR_DOCUMENTS_OF_RECORD HR,
+             HR_DOCUMENT_TYPES_TL HRT
+         WHERE
+             HR.DOCUMENT_TYPE_ID = HRT.DOCUMENT_TYPE_ID
+             AND HRT.LANGUAGE = 'US'
+             AND HRT.DOCUMENT_TYPE = 'Passport'
+             AND HR.PERSON_ID = PAPF.PERSON_ID
+             AND ROWNUM = 1
+        )
+    ) PASSPORT_EXPIRY,
+    
+    -- Visa number
+    NVL(
+        (SELECT HR.DEI_ATTRIBUTE1
+         FROM
+             HR_DOCUMENTS_OF_RECORD HR,
+             HR_DOCUMENT_TYPES_TL HRT
+         WHERE
+             HR.DOCUMENT_TYPE_ID = HRT.DOCUMENT_TYPE_ID
+             AND HRT.LANGUAGE = 'US'
+             AND HRT.DOCUMENT_TYPE = 'Work Visa Details'
+             AND HR.PERSON_ID = PAPF.PERSON_ID
+             AND TRUNC(NVL(HR.DATE_TO, SYSDATE)) = (
+                 SELECT TRUNC(NVL(MAX(HR1.DATE_TO), SYSDATE))
+                 FROM HR_DOCUMENTS_OF_RECORD HR1
+                 WHERE HR1.PERSON_ID = HR.PERSON_ID
+                 AND HR1.DOCUMENT_TYPE_ID = HR.DOCUMENT_TYPE_ID
+             )
+             AND ROWNUM = 1
+        ),
+        (SELECT VISA.VISA_PERMIT_NUMBER
+         FROM PER_VISAS_PERMITS_F VISA
+         WHERE VISA.PERSON_ID = PAPF.PERSON_ID
+         AND VISA.VISA_PERMIT_STATUS = 'A'
+         AND :P_EFFECTIVE_DATE BETWEEN VISA.EFFECTIVE_START_DATE AND VISA.EFFECTIVE_END_DATE
+         AND :P_EFFECTIVE_DATE BETWEEN NVL(VISA.ISSUE_DATE, VISA.EFFECTIVE_START_DATE) 
+                                  AND NVL(VISA.EXPIRATION_DATE, VISA.EFFECTIVE_END_DATE)
+         AND ROWNUM = 1
+        )
+    ) VISA_NUMBER,
+    
+    -- Visa type
+    (SELECT HR.DEI_ATTRIBUTE5
+     FROM
+         HR_DOCUMENTS_OF_RECORD HR,
+         HR_DOCUMENT_TYPES_TL HRT
+     WHERE
+         HR.DOCUMENT_TYPE_ID = HRT.DOCUMENT_TYPE_ID
+         AND HRT.LANGUAGE = 'US'
+         AND HRT.DOCUMENT_TYPE = 'Work Visa Details'
+         AND HR.PERSON_ID = PAPF.PERSON_ID
+         AND TRUNC(NVL(HR.DATE_TO, SYSDATE)) = (
+             SELECT TRUNC(NVL(MAX(HR1.DATE_TO), SYSDATE))
+             FROM HR_DOCUMENTS_OF_RECORD HR1
+             WHERE HR1.PERSON_ID = HR.PERSON_ID
+             AND HR1.DOCUMENT_TYPE_ID = HR.DOCUMENT_TYPE_ID
+         )
+         AND ROWNUM = 1
+    ) VISA_TYPE
+    
+FROM PER_ALL_PEOPLE_F PAPF
+WHERE TRUNC(SYSDATE) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+```
+
+**Key DEI_ATTRIBUTE Columns:**
+- `DEI_ATTRIBUTE1` - Document number (Passport #, Visa #)
+- `DEI_ATTRIBUTE5` - Visa type
+- `DEI_ATTRIBUTE6` - Visa category
+- `DATE_FROM` - Issue date
+- `DATE_TO` - Expiry date
+
+**Latest Document Pattern:**
+```sql
+WHERE TRUNC(NVL(HR.DATE_TO, SYSDATE)) = (
+    SELECT TRUNC(NVL(MAX(HR1.DATE_TO), SYSDATE))
+    FROM HR_DOCUMENTS_OF_RECORD HR1
+    WHERE HR1.PERSON_ID = HR.PERSON_ID
+    AND HR1.DOCUMENT_TYPE_ID = HR.DOCUMENT_TYPE_ID
+)
+```
+
+---
+
+## 🔐 7. ROLE-BASED SECURITY
+
+### Pattern 7.1: PER_ASG_RESPONSIBILITIES Security
+
+**Problem:** Filter data based on user's assigned responsibilities
+
+**Solution:**
+
+```sql
+-- Method 1: Payroll responsibility filter
+WHERE
+    EXISTS (
+        SELECT 1
+        FROM
+            PER_ASG_RESPONSIBILITIES P1,
+            PER_USERS P2
+        WHERE
+            P1.RESPONSIBILITY_TYPE = 'PAY_REP'
+            AND P1.PERSON_ID = P2.PERSON_ID
+            AND TRUNC(SYSDATE) BETWEEN P1.START_DATE AND NVL(P1.END_DATE, TRUNC(SYSDATE))
+            AND P2.USERNAME = FND_GLOBAL.USER_NAME
+            AND P1.PAYROLL_ID = PPA.PAYROLL_ID  -- Filter by payroll
+    )
+
+-- Method 2: Legal entity responsibility filter
+WHERE
+    -- Allow specific users
+    ((FND_GLOBAL.USER_NAME IN ('anisha.suri@appslink-me.com', 
+                               'delivery.team', 
+                               'muhammad.abrar@kentplc.com') AND 1 = 1)
+     
+     -- OR check responsibilities for other users
+     OR (FND_GLOBAL.USER_NAME NOT IN ('anisha.suri@appslink-me.com', 'delivery.team') 
+         AND (
+             -- HR Admin Local access
+             EXISTS (
+                 SELECT 1
+                 FROM PER_ASG_RESPONSIBILITIES P1, PER_USERS P2
+                 WHERE P1.RESPONSIBILITY_TYPE IN ('KENT_HR_ADMIN_LOCAL', 
+                                                 'KENT_CONT_DIRECT', 
+                                                 'KENT_CO_HR_LEAD', 
+                                                 'KENT_HR_DATA_ACCESS')
+                 AND P1.PERSON_ID = P2.PERSON_ID
+                 AND TRUNC(SYSDATE) BETWEEN P1.START_DATE AND NVL(P1.END_DATE, TRUNC(SYSDATE))
+                 AND P2.USERNAME = FND_GLOBAL.USER_NAME
+                 AND P1.LEGAL_ENTITY_ID = PAAF.LEGAL_ENTITY_ID
+             )
+             
+             -- OR Superuser access (all data)
+             OR (
+                 SELECT COUNT(*)
+                 FROM PER_ASG_RESPONSIBILITIES P1, PER_USERS P2
+                 WHERE P1.RESPONSIBILITY_TYPE IN ('KENT_SUPERUSER', 'KENT_TOT_REWA_SPE')
+                 AND P1.PERSON_ID = P2.PERSON_ID
+                 AND TRUNC(SYSDATE) BETWEEN P1.START_DATE AND NVL(P1.END_DATE, TRUNC(SYSDATE))
+                 AND P2.USERNAME = FND_GLOBAL.USER_NAME
+             ) >= 1
+         )
+     )
+    )
+```
+
+**Common Responsibility Types:**
+- `'PAY_REP'` - Payroll representative (by payroll)
+- `'KENT_HR_ADMIN_LOCAL'` - HR admin (by legal entity)
+- `'KENT_SUPERUSER'` - Full access
+- `'KENT_HR_BP'` - HR business partner (by business unit)
+- `'TIME_LABOR_MANAGER'` - Time & Labor manager
+
+**Pattern Components:**
+- `PER_ASG_RESPONSIBILITIES.RESPONSIBILITY_TYPE` - Type of access
+- `PER_ASG_RESPONSIBILITIES.LEGAL_ENTITY_ID` - Legal entity scope
+- `PER_ASG_RESPONSIBILITIES.PAYROLL_ID` - Payroll scope
+- `PER_ASG_RESPONSIBILITIES.BUSINESS_UNIT_ID` - Business unit scope
+- `PER_USERS.USERNAME` - Link to FND_GLOBAL.USER_NAME
+
+---
+
+## 🔄 8. WORKFLOW APPROVAL TRACKING
+
+### Pattern 8.1: Complete Workflow History
+
+**Problem:** Track complete approval history for a transaction
+
+**Solution:**
+
+```sql
+SELECT
+    TXNH.TRANSACTION_ID,
+    TXND.STATE,
+    TXND.STATUS,
+    
+    -- Transaction details
+    HTCE.OBJECT_NAME TRANSACTION_NAME,
+    HART.NAME PROCESS_NAME,
+    
+    -- Submitted by
+    TXND.SUBMITTED_BY USERNAME,
+    (SELECT PAPF.PERSON_NUMBER
+     FROM PER_USERS PU, PER_ALL_PEOPLE_F PAPF
+     WHERE PU.PERSON_ID = PAPF.PERSON_ID
+     AND LOWER(TRIM(PU.USERNAME)) = LOWER(TRIM(TXND.SUBMITTED_BY))
+     AND TRUNC(SYSDATE) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    ) SUBMITTED_EMP_NUMBER,
+    
+    TO_CHAR(TXND.SUBMITTED_DATE, 'DD-MM-YYYY HH:MM:SS') SUBMISSION_DATE,
+    
+    -- Current pending approvers (from WFTASK)
+    (SELECT LISTAGG(REPLACE(ASSIGNEES, ',user', ''), '; ' ON OVERFLOW TRUNCATE) 
+            WITHIN GROUP (ORDER BY IDENTIFICATIONKEY)
+     FROM FA_FUSION_SOAINFRA.WFTASK WF
+     WHERE WF.ASSIGNEES IS NOT NULL
+     AND WF.STATE IN ('ASSIGNED', 'INFO_REQUESTED')
+     AND WF.WORKFLOWPATTERN NOT IN ('AGGREGATION', 'FYI')
+     AND (WF.IDENTIFICATIONKEY = TO_CHAR(TXNH.TRANSACTION_ID) 
+          OR WF.IDENTIFICATIONKEY = TO_CHAR(TXNH.OBJECT_ID))
+     AND WF.CREATOR != WF.FROMUSER  -- Exclude creator
+    ) PENDING_APPROVERS,
+    
+    -- Last approver (from BPM history)
+    (SELECT LISTAGG(DISTINCT PPNF.DISPLAY_NAME, '; ')
+     FROM
+         FND_BPM_TASK_B BPM_TASK,
+         FND_BPM_TASK_HISTORY_B BPM_HIST,
+         PER_USERS PU,
+         PER_PERSON_NAMES_F PPNF
+     WHERE
+         BPM_TASK.TASK_ID = BPM_HIST.TASK_ID
+         AND BPM_HIST.OUTCOME_CODE = 'APPROVE'
+         AND BPM_HIST.STATUS_CODE = 'OUTCOME_UPDATED'
+         AND (BPM_TASK.IDENTIFICATION_KEY = TO_CHAR(TXNH.OBJECT_ID)
+              OR BPM_TASK.IDENTIFICATION_KEY = TO_CHAR(TXNH.TRANSACTION_ID))
+         AND LOWER(BPM_HIST.COMPLETED_BY) = LOWER(PU.USERNAME)
+         AND PU.PERSON_ID = PPNF.PERSON_ID
+         AND BPM_HIST.DOMAIN = 'HCMDomain'
+         AND BPM_HIST.VERSION_REASON = 'TASK_VERSION_REASON_OUTCOME_UPDATED'
+         AND PPNF.NAME_TYPE = 'GLOBAL'
+         AND TRUNC(SYSDATE) BETWEEN PPNF.EFFECTIVE_START_DATE AND PPNF.EFFECTIVE_END_DATE
+    ) LAST_APPROVED_BY,
+    
+    -- Latest workflow comments
+    (SELECT DISTINCT WFC.WFCOMMENT
+     FROM
+         FA_FUSION_SOAINFRA.WFTASK WF,
+         FA_FUSION_SOAINFRA.WFCOMMENTS WFC
+     WHERE
+         WF.TASKID = WFC.TASKID
+         AND (WF.IDENTIFICATIONKEY = TO_CHAR(TXNH.TRANSACTION_ID)
+              OR WF.IDENTIFICATIONKEY = TO_CHAR(TXNH.OBJECT_ID))
+         AND WF.STATE IN ('ASSIGNED', 'INFO_REQUESTED')
+         AND WF.WORKFLOWPATTERN NOT IN ('AGGREGATION', 'FYI')
+         
+         -- Latest comment
+         AND WFC.COMMENTDATE = (
+             SELECT MAX(COMMENTDATE)
+             FROM FA_FUSION_SOAINFRA.WFCOMMENTS
+             WHERE TASKID = WFC.TASKID
+         )
+    ) WF_COMMENTS,
+    
+    -- Last action date
+    (SELECT DISTINCT TO_CHAR(WF.ASSIGNEDDATE, 'DD-MM-YYYY HH:MM:SS')
+     FROM FA_FUSION_SOAINFRA.WFTASK WF
+     WHERE WF.ASSIGNEES IS NOT NULL
+     AND WF.STATE IN ('ASSIGNED', 'INFO_REQUESTED')
+     AND WF.WORKFLOWPATTERN NOT IN ('AGGREGATION', 'FYI')
+     AND (WF.IDENTIFICATIONKEY = TO_CHAR(TXNH.TRANSACTION_ID) 
+          OR WF.IDENTIFICATIONKEY = TO_CHAR(TXNH.OBJECT_ID))
+    ) LAST_ACTION_DATE,
+    
+    -- Attachments
+    (SELECT LISTAGG(DISTINCT FDL.FILE_NAME, ', ') WITHIN GROUP (ORDER BY TO_CHAR(FAD.PK1_VALUE))
+     FROM
+         FND_ATTACHED_DOCUMENTS FAD,
+         FND_DOCUMENTS_TL FDL
+     WHERE
+         FAD.DOCUMENT_ID = FDL.DOCUMENT_ID
+         AND FAD.PK1_VALUE = TO_CHAR(TXNH.TRANSACTION_ID)
+         AND FDL.LANGUAGE = 'US'
+    ) ATTACHMENT_NAMES
+    
+FROM
+    HRC_TXN_HEADER TXNH,
+    HRC_TXN_DATA TXND,
+    HRC_TXN_CONSOLE_ENTRY HTCE,
+    HRC_ARM_PROCESS_TL HART,
+    HCM_LOOKUPS HL
+WHERE
+    TXNH.TRANSACTION_ID = TXND.TRANSACTION_ID
+    AND TXNH.TRANSACTION_ID = HTCE.TRANSACTION_ID(+)
+    AND TXNH.PROCESS_ID = HART.PROCESS_ID(+)
+    AND HART.LANGUAGE(+) = 'US'
+    AND HART.SOURCE_LANG(+) = 'US'
+    
+    AND TXNH.FAMILY = 'HCM'
+    AND HTCE.CONSOLE_TXN_STATUS = HL.LOOKUP_CODE(+)
+    AND HL.LOOKUP_TYPE(+) = 'ORA_HRC_TXN_CON_EXT_TXN_STATUS'
+```
+
+**Key Workflow Tables:**
+- `HRC_TXN_HEADER` - Transaction header (TRANSACTION_ID, OBJECT_ID)
+- `HRC_TXN_DATA` - Transaction data (STATE, STATUS, SUBMITTED_BY)
+- `HRC_TXN_CONSOLE_ENTRY` - Console entry (CONSOLE_TXN_STATUS)
+- `FA_FUSION_SOAINFRA.WFTASK` - Active workflow tasks (pending approvers)
+- `FND_BPM_TASK_B` / `FND_BPM_TASK_HISTORY_B` - Workflow history (completed approvals)
+- `FA_FUSION_SOAINFRA.WFCOMMENTS` - Workflow comments
+- `FND_ATTACHED_DOCUMENTS` / `FND_DOCUMENTS_TL` - Attachments
+
+---
+
+## 🎯 9. ADVANCED COMPENSATION EXTRACTION
+
+### Pattern 9.1: Transaction-Based Compensation Changes
+
+**Problem:** Extract compensation changes from transactions (not payroll)
+
+**Solution:**
+
+```sql
+SELECT
+    TXNH.TRANSACTION_ID,
+    
+    -- Person details
+    (SELECT PERSON_NUMBER
+     FROM PER_ALL_PEOPLE_F
+     WHERE PERSON_ID = TXNH.SUBJECT_ID
+     AND ROWNUM = 1
+    ) PERSON_NUMBER,
+    
+    -- Plan and component
+    CPV.PLAN_NAME,
+    CCV.COMPONENT_NAME,
+    
+    -- New value
+    CASE
+        WHEN PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'Uom', 'NewValue') 
+             NOT IN ('H_HHMM', 'H_HHMMSS', 'H_DECIMAL1', 'H_DECIMAL2', 'H_DECIMAL3')
+        THEN PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'ScreenEntryValue', 'NewValue')
+        ELSE PAY_CHECKFORMAT.CHANGEFORMAT(
+                 PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'ScreenEntryValue', 'NewValue'),
+                 PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'Uom', 'NewValue'),
+                 NULL)
+    END NEW_VALUE,
+    
+    -- Currency
+    (SELECT NAME
+     FROM FND_CURRENCIES_VL
+     WHERE CURRENCY_CODE = PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'InputCurrencyCode', 'NewId')
+    ) CURRENCY,
+    
+    -- Dates
+    PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'EffectiveStartDate', 'NewValue') START_DATE,
+    PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'EffectiveEndDate', 'NewValue') END_DATE,
+    
+    -- Frequency
+    (SELECT MEANING
+     FROM FND_LOOKUP_VALUES_VL
+     WHERE LOOKUP_TYPE = 'CMP_VC_NO_OF_OCCUR'
+     AND LOOKUP_CODE = PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'ProcessingType', 'NewId')
+    ) FREQUENCY
+    
+FROM
+    HRC_TXN_HEADER TXNH,
+    HRC_TXN_DATA TXND,
+    CMP_PLANS_TL CPV,
+    CMP_COMPONENTS_TL CCV,
+    TABLE(PER_BIPNTF_UTILITY.EXTRACTXMLSEQUENCEFORVO(TXNH.TRANSACTION_ID, 'VariableCompOverviewVO')) CompareNode
+WHERE
+    TXNH.TRANSACTION_ID = TXND.TRANSACTION_ID
+    AND TXNH.MODULE_IDENTIFIER = 'Make Personal Contribution'  -- Or 'Individual Compensation'
+    AND TXNH.FAMILY = 'HCM'
+    
+    -- Plan and component linkage
+    AND CPV.PLAN_ID = PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'PlanId', 'NewValue')
+    AND CPV.LANGUAGE = USERENV('LANG')
+    
+    AND CCV.COMPONENT_ID = PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'ComponentId', 'NewValue')
+    AND CCV.LANGUAGE = USERENV('LANG')
+    
+    -- New records only
+    AND PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'ViewStatusCode', 'NewValue') = 'NEW'
+    AND PER_BIPNTF_FLEX.GETATTRIBUTE('VariableCompOverviewVO', VALUE(CompareNode), 'IsSplitRow', 'NewValue') != 'true'
+```
+
+**Key Functions:**
+- `PER_BIPNTF_UTILITY.EXTRACTXMLSEQUENCEFORVO` - Extract XML sequence for VO
+- `PER_BIPNTF_FLEX.GETATTRIBUTE` - Get attribute from transaction XML
+- `PAY_CHECKFORMAT.CHANGEFORMAT` - Format time values
+
+---
+
+## 🧮 10. ADVANCED ACCRUAL CALCULATIONS
+
+### Pattern 10.1: Gratuity Accrual from Payroll
+
+**Problem:** Extract gratuity accrual components from payroll run
+
+**Solution:**
+
+```sql
+SELECT
+    PAPF.PERSON_NUMBER,
+    PPNF.DISPLAY_NAME,
+    
+    -- Service calculations
+    NVL((SELECT SUM(TO_NUMBER(PRRVB.RESULT_VALUE))
+         FROM
+             PAY_ELEMENT_TYPES_F PETFB,
+             PAY_ELEMENT_TYPES_TL PETF1B,
+             PAY_INPUT_VALUES_F PIVFB,
+             PAY_INPUT_VALUES_TL PIVTFB,
+             PAY_RUN_RESULTS PRRB,
+             PAY_RUN_RESULT_VALUES PRRVB
+         WHERE
+             PETFB.ELEMENT_TYPE_ID = PIVFB.ELEMENT_TYPE_ID
+             AND PETFB.ELEMENT_TYPE_ID = PETF1B.ELEMENT_TYPE_ID
+             AND PIVTFB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.RUN_RESULT_ID = PRRVB.RUN_RESULT_ID
+             AND PRRVB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+             
+             AND PETF1B.LANGUAGE = 'US'
+             AND PIVTFB.LANGUAGE = 'US'
+             AND PETF1B.REPORTING_NAME = 'Gratuity Accrual'
+             AND PIVTFB.NAME = 'Total Unpaid Leave Days'
+             
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PETFB.EFFECTIVE_START_DATE AND PETFB.EFFECTIVE_END_DATE
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PIVFB.EFFECTIVE_START_DATE AND PIVFB.EFFECTIVE_END_DATE
+        ), 0) UNPAID_LEAVE_DAYS,
+    
+    NVL((SELECT SUM(TO_NUMBER(PRRVB.RESULT_VALUE))
+         FROM
+             PAY_ELEMENT_TYPES_F PETFB,
+             PAY_ELEMENT_TYPES_TL PETF1B,
+             PAY_INPUT_VALUES_F PIVFB,
+             PAY_INPUT_VALUES_TL PIVTFB,
+             PAY_RUN_RESULTS PRRB,
+             PAY_RUN_RESULT_VALUES PRRVB
+         WHERE
+             PETFB.ELEMENT_TYPE_ID = PIVFB.ELEMENT_TYPE_ID
+             AND PETFB.ELEMENT_TYPE_ID = PETF1B.ELEMENT_TYPE_ID
+             AND PIVTFB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.RUN_RESULT_ID = PRRVB.RUN_RESULT_ID
+             AND PRRVB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+             
+             AND PETF1B.LANGUAGE = 'US'
+             AND PIVTFB.LANGUAGE = 'US'
+             AND PETF1B.REPORTING_NAME = 'Gratuity Accrual'
+             AND PIVTFB.NAME = 'Total Seniority Days'
+             
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PETFB.EFFECTIVE_START_DATE AND PETFB.EFFECTIVE_END_DATE
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PIVFB.EFFECTIVE_START_DATE AND PIVFB.EFFECTIVE_END_DATE
+        ), 0) SENIORITY_DAYS,
+    
+    NVL((SELECT SUM(TO_NUMBER(PRRVB.RESULT_VALUE))
+         FROM
+             PAY_ELEMENT_TYPES_F PETFB,
+             PAY_ELEMENT_TYPES_TL PETF1B,
+             PAY_INPUT_VALUES_F PIVFB,
+             PAY_INPUT_VALUES_TL PIVTFB,
+             PAY_RUN_RESULTS PRRB,
+             PAY_RUN_RESULT_VALUES PRRVB
+         WHERE
+             PETFB.ELEMENT_TYPE_ID = PIVFB.ELEMENT_TYPE_ID
+             AND PETFB.ELEMENT_TYPE_ID = PETF1B.ELEMENT_TYPE_ID
+             AND PIVTFB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.RUN_RESULT_ID = PRRVB.RUN_RESULT_ID
+             AND PRRVB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+             
+             AND PETF1B.LANGUAGE = 'US'
+             AND PIVTFB.LANGUAGE = 'US'
+             AND PETF1B.REPORTING_NAME = 'Gratuity Accrual'
+             AND PIVTFB.NAME = 'Service Days'
+             
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PETFB.EFFECTIVE_START_DATE AND PETFB.EFFECTIVE_END_DATE
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PIVFB.EFFECTIVE_START_DATE AND PIVFB.EFFECTIVE_END_DATE
+        ), 0) SERVICE_DAYS,
+    
+    -- Monthly accrual
+    NVL((SELECT SUM(TO_NUMBER(PRRVB.RESULT_VALUE))
+         FROM
+             PAY_ELEMENT_TYPES_F PETFB,
+             PAY_ELEMENT_TYPES_TL PETF1B,
+             PAY_INPUT_VALUES_F PIVFB,
+             PAY_INPUT_VALUES_TL PIVTFB,
+             PAY_RUN_RESULTS PRRB,
+             PAY_RUN_RESULT_VALUES PRRVB
+         WHERE
+             PETFB.ELEMENT_TYPE_ID = PIVFB.ELEMENT_TYPE_ID
+             AND PETFB.ELEMENT_TYPE_ID = PETF1B.ELEMENT_TYPE_ID
+             AND PIVTFB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.RUN_RESULT_ID = PRRVB.RUN_RESULT_ID
+             AND PRRVB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+             
+             AND PETF1B.LANGUAGE = 'US'
+             AND PIVTFB.LANGUAGE = 'US'
+             AND PETF1B.REPORTING_NAME = 'Gratuity Accrual'
+             AND PIVTFB.NAME = 'Monthly Days'
+             
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PETFB.EFFECTIVE_START_DATE AND PETFB.EFFECTIVE_END_DATE
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PIVFB.EFFECTIVE_START_DATE AND PIVFB.EFFECTIVE_END_DATE
+        ), 0) MONTHLY_DAYS_ACCRUED,
+    
+    NVL((SELECT SUM(TO_NUMBER(PRRVB.RESULT_VALUE))
+         FROM
+             PAY_ELEMENT_TYPES_F PETFB,
+             PAY_ELEMENT_TYPES_TL PETF1B,
+             PAY_INPUT_VALUES_F PIVFB,
+             PAY_INPUT_VALUES_TL PIVTFB,
+             PAY_RUN_RESULTS PRRB,
+             PAY_RUN_RESULT_VALUES PRRVB
+         WHERE
+             PETFB.ELEMENT_TYPE_ID = PIVFB.ELEMENT_TYPE_ID
+             AND PETFB.ELEMENT_TYPE_ID = PETF1B.ELEMENT_TYPE_ID
+             AND PIVTFB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.RUN_RESULT_ID = PRRVB.RUN_RESULT_ID
+             AND PRRVB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+             
+             AND PETF1B.LANGUAGE = 'US'
+             AND PIVTFB.LANGUAGE = 'US'
+             AND PETF1B.REPORTING_NAME = 'Gratuity Accrual'
+             AND PIVTFB.NAME = 'Monthly Amount'
+             
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PETFB.EFFECTIVE_START_DATE AND PETFB.EFFECTIVE_END_DATE
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PIVFB.EFFECTIVE_START_DATE AND PIVFB.EFFECTIVE_END_DATE
+        ), 0) MONTHLY_AMOUNT_ACCRUED,
+    
+    -- Total accrual
+    NVL((SELECT SUM(TO_NUMBER(PRRVB.RESULT_VALUE))
+         FROM
+             PAY_ELEMENT_TYPES_F PETFB,
+             PAY_ELEMENT_TYPES_TL PETF1B,
+             PAY_INPUT_VALUES_F PIVFB,
+             PAY_INPUT_VALUES_TL PIVTFB,
+             PAY_RUN_RESULTS PRRB,
+             PAY_RUN_RESULT_VALUES PRRVB
+         WHERE
+             PETFB.ELEMENT_TYPE_ID = PIVFB.ELEMENT_TYPE_ID
+             AND PETFB.ELEMENT_TYPE_ID = PETF1B.ELEMENT_TYPE_ID
+             AND PIVTFB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.RUN_RESULT_ID = PRRVB.RUN_RESULT_ID
+             AND PRRVB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+             
+             AND PETF1B.LANGUAGE = 'US'
+             AND PIVTFB.LANGUAGE = 'US'
+             AND PETF1B.REPORTING_NAME = 'Gratuity Accrual'
+             AND PIVTFB.NAME = 'Total Days'
+             
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PETFB.EFFECTIVE_START_DATE AND PETFB.EFFECTIVE_END_DATE
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PIVFB.EFFECTIVE_START_DATE AND PIVFB.EFFECTIVE_END_DATE
+        ), 0) TOTAL_DAYS_ACCRUED,
+    
+    NVL((SELECT SUM(TO_NUMBER(PRRVB.RESULT_VALUE))
+         FROM
+             PAY_ELEMENT_TYPES_F PETFB,
+             PAY_ELEMENT_TYPES_TL PETF1B,
+             PAY_INPUT_VALUES_F PIVFB,
+             PAY_INPUT_VALUES_TL PIVTFB,
+             PAY_RUN_RESULTS PRRB,
+             PAY_RUN_RESULT_VALUES PRRVB
+         WHERE
+             PETFB.ELEMENT_TYPE_ID = PIVFB.ELEMENT_TYPE_ID
+             AND PETFB.ELEMENT_TYPE_ID = PETF1B.ELEMENT_TYPE_ID
+             AND PIVTFB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.RUN_RESULT_ID = PRRVB.RUN_RESULT_ID
+             AND PRRVB.INPUT_VALUE_ID = PIVFB.INPUT_VALUE_ID
+             AND PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+             
+             AND PETF1B.LANGUAGE = 'US'
+             AND PIVTFB.LANGUAGE = 'US'
+             AND PETF1B.REPORTING_NAME = 'Gratuity Accrual'
+             AND PIVTFB.NAME = 'Total Amount'
+             
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PETFB.EFFECTIVE_START_DATE AND PETFB.EFFECTIVE_END_DATE
+             AND TRUNC(PPA.EFFECTIVE_DATE) BETWEEN PIVFB.EFFECTIVE_START_DATE AND PIVFB.EFFECTIVE_END_DATE
+        ), 0) TOTAL_AMOUNT_ACCRUED
+    
+FROM
+    PER_ALL_PEOPLE_F PAPF,
+    PER_PERSON_NAMES_F PPNF,
+    PER_ALL_ASSIGNMENTS_M ASG,
+    PAY_PAYROLL_ASSIGNMENTS PASG,
+    PAY_PAYROLL_ACTIONS PPA,
+    PAY_PAYROLL_REL_ACTIONS PPRA,
+    PAY_TIME_PERIODS PTP
+WHERE
+    PAPF.PERSON_ID = PPNF.PERSON_ID
+    AND PAPF.PERSON_ID = ASG.PERSON_ID
+    
+    AND ASG.ASSIGNMENT_ID = PASG.HR_ASSIGNMENT_ID
+    AND PASG.PAYROLL_RELATIONSHIP_ID = PPRA.PAYROLL_RELATIONSHIP_ID
+    AND PPRA.PAYROLL_ACTION_ID = PPA.PAYROLL_ACTION_ID
+    AND PPA.EARN_TIME_PERIOD_ID = PTP.TIME_PERIOD_ID
+    
+    -- Payroll filters
+    AND PPA.ACTION_TYPE IN ('Q', 'R')
+    AND PPA.ACTION_STATUS = 'C'
+    AND PPRA.RUN_TYPE_ID IS NOT NULL
+    AND PPRA.RETRO_COMPONENT_ID IS NULL
+    AND PPRA.ACTION_STATUS = 'C'
+    
+    AND PPNF.NAME_TYPE = 'GLOBAL'
+    AND ASG.ASSIGNMENT_TYPE = 'E'
+    AND ASG.PRIMARY_FLAG = 'Y'
+    AND ASG.EFFECTIVE_LATEST_CHANGE = 'Y'
+    
+    -- Period filter
+    AND LAST_DAY(PTP.END_DATE) = LAST_DAY(TO_DATE(:P_PERIOD, 'YYYY-MM-DD'))
+    
+    AND TRUNC(SYSDATE) BETWEEN PAPF.EFFECTIVE_START_DATE AND PAPF.EFFECTIVE_END_DATE
+    AND TRUNC(SYSDATE) BETWEEN PPNF.EFFECTIVE_START_DATE AND PPNF.EFFECTIVE_END_DATE
+    AND TRUNC(SYSDATE) BETWEEN ASG.EFFECTIVE_START_DATE AND ASG.EFFECTIVE_END_DATE
+```
+
+**Gratuity Accrual Input Values:**
+- `'Total Unpaid Leave Days'` - Days excluded from service
+- `'Total Seniority Days'` - Days used for seniority calculation
+- `'Service Days'` - Total service days
+- `'Monthly Days'` - Days accrued this month
+- `'Monthly Amount'` - Amount accrued this month
+- `'Total Days'` - Total days accrued
+- `'Total Amount'` - Total amount accrued
+
+### Pattern 10.2: Annual Leave Accrual Components
+
+**Reporting Names:**
+- `'Annual Leave CD Accrual Result'` - Calendar days accrual
+- `'Annual Leave WD Accrual Result'` - Working days accrual
+- `'Annual Leave CD Final Disbursement Result'` - EOS payment (calendar days)
+- `'Annual Leave WD Final Disbursement Result'` - EOS payment (working days)
+- `'Annual Leave CD Discretionary Disbursement Result'` - Encashment (calendar days)
+- `'Annual Leave WD Discretionary Disbursement Result'` - Encashment (working days)
+- `'Annual Leave Encashment Reversal'` - Encashment reversal
+- `'Annual Leave Salary Accrual'` - Salary-based accrual
+
+**Input Values:**
+- `'Unit (Days)'` - Days component
+- `'Liability'` - Amount component
+- `'Pay Value'` - Payment value
+- `'Monthly Accrual Amount'` - Monthly accrual amount
+- `'Total Days'` - Total days
+- `'Total Amount'` - Total amount
+
+---
+
+**END OF PART 2**
+
+**Status:** Production-Ready  
+**Last Updated:** 07-Jan-2026  
+**Continue to module-specific updates...**

@@ -1,0 +1,126 @@
+
+```
+SaaS-fusion-kb
+├─ .DS_Store
+├─ AGENT_PERSONA.md
+├─ AI_EXPANSION_PROMPTS.md
+├─ CONFIGURATION
+│  └─ ENV_METADATA.md
+├─ FINANCE
+│  ├─ .DS_Store
+│  ├─ AP
+│  │  ├─ AP_MASTER.md
+│  │  ├─ AP_REPOSITORIES.md
+│  │  └─ AP_TEMPLATES.md
+│  ├─ AR
+│  │  ├─ AR_ACCOUNT_STRUCTURE.md
+│  │  ├─ AR_Customer_Aging_5_Bucket.sql
+│  │  ├─ AR_Customer_Ledger.sql
+│  │  ├─ AR_MASTER.md
+│  │  ├─ AR_REPOSITORIES.md
+│  │  └─ AR_TEMPLATES.md
+│  ├─ CM
+│  │  ├─ CM_MASTER.md
+│  │  ├─ CM_REPOSITORIES.md
+│  │  └─ CM_TEMPLATES.md
+│  ├─ CROSS_MODULE
+│  │  ├─ CROSS_MODULE_MASTER.md
+│  │  └─ CROSS_MODULE_TEMPLATES.md
+│  ├─ FA
+│  │  ├─ FA_MASTER.md
+│  │  ├─ FA_REPOSITORIES.md
+│  │  └─ FA_TEMPLATES.md
+│  ├─ FINANCE_INSTRUCTIONS.md
+│  └─ GL
+│     ├─ GL_MASTER.md
+│     ├─ GL_REPOSITORIES.md
+│     └─ GL_TEMPLATES.md
+├─ GAP_ANALYSIS.md
+├─ GOVERNANCE.md
+├─ HCM
+│  ├─ ABSENCE
+│  │  ├─ ABSENCE_MASTER.md
+│  │  ├─ ABSENCE_REPOSITORIES.md
+│  │  └─ ABSENCE_TEMPLATES.md
+│  ├─ BEN
+│  │  ├─ BEN_MASTER.md
+│  │  ├─ BEN_REPOSITORIES.md
+│  │  └─ BEN_TEMPLATES.md
+│  ├─ COMPENSATION
+│  │  ├─ CMP_MASTER.md
+│  │  ├─ CMP_REPOSITORIES.md
+│  │  └─ CMP_TEMPLATES.md
+│  ├─ CRITICAL_PERSON_TYPE_FIX.md
+│  ├─ HCM_CROSS_MODULE_PATTERNS_07-01-26.md
+│  ├─ HCM_CROSS_MODULE_PATTERNS_PART2_07-01-26.md
+│  ├─ HCM_INSTRUCTIONS.md
+│  ├─ HCM_KB_COMPREHENSIVE_UPDATE_07-01-26.md
+│  ├─ HCM_KB_CROSS_MODULE_UPDATE_02-01-26.md
+│  ├─ HCM_KB_UPDATE_ORC_07-01-26.md
+│  ├─ HCM_KB_UPDATE_SUMMARY_18-12-25.md
+│  ├─ HCM_KB_UPDATE_SUMMARY_31-12-25.md
+│  ├─ HCM_PRODUCTION_PATTERNS_18-12-25.md
+│  ├─ HCM_QUERY_ANALYSIS_18-12-25.md
+│  ├─ HR
+│  │  ├─ HR_MASTER.md
+│  │  ├─ HR_REPOSITORIES.md
+│  │  └─ HR_TEMPLATES.md
+│  ├─ PAY
+│  │  ├─ PAY_MASTER.md
+│  │  ├─ PAY_REPOSITORIES.md
+│  │  └─ PAY_TEMPLATES.md
+│  ├─ README_HCM_KB_UPDATE_07-01-26.md
+│  ├─ RECRUITING
+│  │  ├─ EXECUTIVE_SUMMARY_ORC_KB_07-01-26.md
+│  │  ├─ ORC_ADVANCED_PATTERNS_07-01-26.md
+│  │  ├─ ORC_COMPREHENSIVE_GUIDE_07-01-26.md
+│  │  ├─ ORC_KNOWLEDGE_SUMMARY_07-01-26.md
+│  │  ├─ ORC_MASTER.md
+│  │  ├─ ORC_MASTER_07-01-26.md
+│  │  ├─ ORC_QUERY_TEMPLATES_07-01-26.md
+│  │  ├─ ORC_REPOSITORIES.md
+│  │  ├─ ORC_TABLE_REFERENCE_07-01-26.md
+│  │  ├─ ORC_TEMPLATES.md
+│  │  └─ README_ORC_KNOWLEDGE_BASE.md
+│  └─ TIME_LABOR
+│     ├─ README_OTL_KNOWLEDGE_BASE.md
+│     ├─ TL_MASTER.md
+│     ├─ TL_OTL_COMPREHENSIVE_GUIDE_07-01-26.md
+│     ├─ TL_OTL_KNOWLEDGE_SUMMARY_07-01-26.md
+│     ├─ TL_REPOSITORIES.md
+│     └─ TL_TEMPLATES.md
+├─ PPM
+│  ├─ COSTING
+│  │  ├─ COSTING_MASTER.md
+│  │  ├─ COSTING_REPOSITORIES.md
+│  │  └─ COSTING_TEMPLATES.md
+│  ├─ PPM_INSTRUCTIONS.md
+│  └─ PROJECTS
+│     ├─ PROJECTS_MASTER.md
+│     ├─ PROJECTS_REPOSITORIES.md
+│     └─ PROJECTS_TEMPLATES.md
+├─ SCM
+│  ├─ CROSS_MODULE
+│  │  ├─ CROSS_MODULE_MASTER.md
+│  │  └─ CROSS_MODULE_TEMPLATES.md
+│  ├─ INV
+│  │  ├─ INV_MASTER.md
+│  │  ├─ INV_REPOSITORIES.md
+│  │  └─ INV_TEMPLATES.md
+│  ├─ OM
+│  │  ├─ OM_MASTER.md
+│  │  ├─ OM_REPOSITORIES.md
+│  │  └─ OM_TEMPLATES.md
+│  ├─ PO
+│  │  ├─ PO_MASTER.md
+│  │  ├─ PO_REPOSITORIES.md
+│  │  └─ PO_TEMPLATES.md
+│  ├─ SCM_INSTRUCTIONS.md
+│  └─ SOURCING
+│     ├─ SOURCING_MASTER.md
+│     ├─ SOURCING_REPOSITORIES.md
+│     └─ SOURCING_TEMPLATES.md
+├─ SOLUTION_ARCHITECTURE.md
+└─ SYSTEM_INSTRUCTIONS.md
+
+```

@@ -1,0 +1,717 @@
+# Payroll Repositories
+
+**Module:** Global Payroll  
+**Tag:** `#HCM #PAY #Repositories`  
+**Status:** Production-Ready  
+**Last Updated:** 13-Jan-2026  
+**Version:** 2.0 (Merged with update file)
+
+---
+
+## Critical Rules
+
+1. **NEVER** write fresh payroll joins from scratch
+2. **ALWAYS** copy these CTEs as-is
+3. **ALWAYS** include `/*+ qb_name(NAME) MATERIALIZE */` hints
+4. **ALWAYS** filter by `ACTION_TYPE` and `ACTION_STATUS`
+5. **ALWAYS** exclude `RETRO_COMPONENT_ID`
+
+---
+
+## 1. Run Results CTEs
+
+### 1.1 PAY_RESULTS_MASTER
+
+**Purpose:** Get calculated payroll results (earnings/deductions) for a period
+
+**When to Use:** For payslip reports, element registers, earning/deduction totals
+
+```sql
+PAY_RESULTS_MASTER AS (
+    SELECT /*+ qb_name(PAY_RES) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,PPRD.PAYROLL_RELATIONSHIP_NUMBER
+          ,PPA.EFFECTIVE_DATE
+          ,PPA.PAYROLL_ACTION_ID
+          ,PTP.PERIOD_NAME
+          ,PETT.ELEMENT_NAME
+          ,PETT.REPORTING_NAME
+          ,PETF.BASE_ELEMENT_NAME
+          ,PETF.CLASSIFICATION_ID
+          ,PECT.CLASSIFICATION_NAME
+          ,PEC.BASE_CLASSIFICATION_NAME
+          ,TO_NUMBER(PRRV.RESULT_VALUE) RESULT_VALUE
+          ,PIVT.NAME INPUT_VALUE_NAME
+          ,PIVF.BASE_NAME INPUT_VALUE_BASE_NAME
+    FROM   PAY_PAYROLL_ACTIONS PPA
+          ,PAY_PAYROLL_REL_ACTIONS PPRA
+          ,PAY_RUN_RESULTS PRR
+          ,PAY_RUN_RESULT_VALUES PRRV
+          ,PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_TIME_PERIODS PTP
+          ,PAY_ELEMENT_TYPES_F PETF
+          ,PAY_ELEMENT_TYPES_TL PETT
+          ,PAY_INPUT_VALUES_F PIVF
+          ,PAY_INPUT_VALUES_TL PIVT
+          ,PAY_ELE_CLASSIFICATIONS PEC
+          ,PAY_ELE_CLASSIFICATIONS_TL PECT
+    WHERE  PPRA.PAYROLL_ACTION_ID = PPA.PAYROLL_ACTION_ID
+      AND  PRR.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+      AND  PRRV.RUN_RESULT_ID = PRR.RUN_RESULT_ID
+      AND  PPRA.PAYROLL_RELATIONSHIP_ID = PPRD.PAYROLL_RELATIONSHIP_ID
+      AND  PPA.ACTION_TYPE IN ('Q', 'R')
+      AND  PPA.ACTION_STATUS IN ('C')
+      AND  PPA.EARN_TIME_PERIOD_ID = PTP.TIME_PERIOD_ID
+      AND  PETF.ELEMENT_TYPE_ID = PRR.ELEMENT_TYPE_ID
+      AND  PETF.ELEMENT_TYPE_ID = PETT.ELEMENT_TYPE_ID
+      AND  PIVF.ELEMENT_TYPE_ID = PETF.ELEMENT_TYPE_ID
+      AND  PIVF.INPUT_VALUE_ID = PRRV.INPUT_VALUE_ID
+      AND  PIVF.INPUT_VALUE_ID = PIVT.INPUT_VALUE_ID
+      AND  PPRA.RETRO_COMPONENT_ID IS NULL
+      AND  PETF.CLASSIFICATION_ID = PEC.CLASSIFICATION_ID
+      AND  PETF.CLASSIFICATION_ID = PECT.CLASSIFICATION_ID
+      AND  PETT.LANGUAGE = 'US'
+      AND  PIVT.LANGUAGE = 'US'
+      AND  PECT.LANGUAGE = 'US'
+      AND  PIVF.BASE_NAME = 'Pay Value'
+      AND  TRUNC(LAST_DAY(PPA.EFFECTIVE_DATE)) = :P_PERIOD_END
+)
+```
+
+**Key Fields:**
+- `PERSON_ID` - Link to PER_ALL_PEOPLE_F
+- `ELEMENT_NAME` - Translated element name (use this for display)
+- `REPORTING_NAME` - For filtering accruals
+- `BASE_ELEMENT_NAME` - For filtering hardcoded elements
+- `CLASSIFICATION_NAME` - For grouping (Earnings, Deductions, Information)
+- `BASE_CLASSIFICATION_NAME` - For filtering by type
+- `RESULT_VALUE` - The monetary amount ($$)
+
+### 1.2 PAY_RESULTS_SIMPLE
+
+**Purpose:** Simplified version with only Pay Value
+
+**When to Use:** When you only need monetary amounts, not other input values
+
+```sql
+PAY_RESULTS_SIMPLE AS (
+    SELECT /*+ qb_name(PAY_RES_S) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,PETT.ELEMENT_NAME
+          ,SUM(TO_NUMBER(PRRV.RESULT_VALUE)) AMOUNT
+    FROM   PAY_PAYROLL_ACTIONS PPA
+          ,PAY_PAYROLL_REL_ACTIONS PPRA
+          ,PAY_RUN_RESULTS PRR
+          ,PAY_RUN_RESULT_VALUES PRRV
+          ,PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_ELEMENT_TYPES_F PETF
+          ,PAY_ELEMENT_TYPES_TL PETT
+          ,PAY_INPUT_VALUES_F PIVF
+    WHERE  PPRA.PAYROLL_ACTION_ID = PPA.PAYROLL_ACTION_ID
+      AND  PRR.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+      AND  PRRV.RUN_RESULT_ID = PRR.RUN_RESULT_ID
+      AND  PPRA.PAYROLL_RELATIONSHIP_ID = PPRD.PAYROLL_RELATIONSHIP_ID
+      AND  PPA.ACTION_TYPE IN ('Q', 'R')
+      AND  PPA.ACTION_STATUS IN ('C')
+      AND  PETF.ELEMENT_TYPE_ID = PRR.ELEMENT_TYPE_ID
+      AND  PETF.ELEMENT_TYPE_ID = PETT.ELEMENT_TYPE_ID
+      AND  PIVF.ELEMENT_TYPE_ID = PETF.ELEMENT_TYPE_ID
+      AND  PIVF.INPUT_VALUE_ID = PRRV.INPUT_VALUE_ID
+      AND  PPRA.RETRO_COMPONENT_ID IS NULL
+      AND  PETT.LANGUAGE = 'US'
+      AND  PIVF.BASE_NAME = 'Pay Value'
+      AND  TRUNC(LAST_DAY(PPA.EFFECTIVE_DATE)) = :P_PERIOD_END
+    GROUP BY PPRD.PERSON_ID, PETT.ELEMENT_NAME
+)
+```
+
+### 1.3 PAY_RESULTS_CLASSIFICATION
+
+**Purpose:** Aggregate results by classification (Earnings, Deductions)
+
+**When to Use:** For totals, net pay calculations
+
+```sql
+PAY_RESULTS_CLASS AS (
+    SELECT /*+ qb_name(PAY_CLS) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,PEC.BASE_CLASSIFICATION_NAME
+          ,SUM(TO_NUMBER(PRRV.RESULT_VALUE)) AMOUNT
+    FROM   PAY_PAYROLL_ACTIONS PPA
+          ,PAY_PAYROLL_REL_ACTIONS PPRA
+          ,PAY_RUN_RESULTS PRR
+          ,PAY_RUN_RESULT_VALUES PRRV
+          ,PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_ELEMENT_TYPES_F PETF
+          ,PAY_INPUT_VALUES_F PIVF
+          ,PAY_ELE_CLASSIFICATIONS PEC
+    WHERE  PPRA.PAYROLL_ACTION_ID = PPA.PAYROLL_ACTION_ID
+      AND  PRR.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+      AND  PRRV.RUN_RESULT_ID = PRR.RUN_RESULT_ID
+      AND  PPRA.PAYROLL_RELATIONSHIP_ID = PPRD.PAYROLL_RELATIONSHIP_ID
+      AND  PPA.ACTION_TYPE IN ('Q', 'R')
+      AND  PPA.ACTION_STATUS IN ('C')
+      AND  PETF.ELEMENT_TYPE_ID = PRR.ELEMENT_TYPE_ID
+      AND  PIVF.ELEMENT_TYPE_ID = PETF.ELEMENT_TYPE_ID
+      AND  PIVF.INPUT_VALUE_ID = PRRV.INPUT_VALUE_ID
+      AND  PPRA.RETRO_COMPONENT_ID IS NULL
+      AND  PETF.CLASSIFICATION_ID = PEC.CLASSIFICATION_ID
+      AND  PIVF.BASE_NAME = 'Pay Value'
+      AND  TRUNC(LAST_DAY(PPA.EFFECTIVE_DATE)) = :P_PERIOD_END
+    GROUP BY PPRD.PERSON_ID, PEC.BASE_CLASSIFICATION_NAME
+)
+```
+
+---
+
+## 2. Element Entry CTEs
+
+### 2.1 PAY_ENTRY_BASIC
+
+**Purpose:** Get current Basic Salary from element entries
+
+**When to Use:** For compensation reports, salary listings
+
+```sql
+PAY_ENTRY_BASIC AS (
+    SELECT /*+ qb_name(PAY_ENT_BAS) MATERIALIZE */
+           PEEF.PERSON_ID
+          ,ROUND(TO_NUMBER(PEEV.SCREEN_ENTRY_VALUE) / 12, 2) MONTHLY_BASIC
+    FROM   PAY_ELEMENT_TYPES_VL PETV
+          ,PAY_ELEMENT_ENTRIES_F PEEF
+          ,PAY_ELEMENT_ENTRY_VALUES_F PEEV
+          ,PAY_INPUT_VALUES_VL PIVL
+    WHERE  PETV.ELEMENT_TYPE_ID = PEEF.ELEMENT_TYPE_ID
+      AND  PEEF.ELEMENT_ENTRY_ID = PEEV.ELEMENT_ENTRY_ID
+      AND  PEEV.INPUT_VALUE_ID = PIVL.INPUT_VALUE_ID
+      AND  PETV.BASE_ELEMENT_NAME = 'Basic'
+      AND  UPPER(TRIM(PIVL.NAME)) = 'AMOUNT'
+      AND  :P_DATE BETWEEN TRUNC(PEEF.EFFECTIVE_START_DATE) 
+                       AND TRUNC(PEEF.EFFECTIVE_END_DATE)
+      AND  :P_DATE BETWEEN TRUNC(PEEV.EFFECTIVE_START_DATE) 
+                       AND TRUNC(PEEV.EFFECTIVE_END_DATE)
+)
+```
+
+### 2.2 PAY_ENTRY_GROSS
+
+**Purpose:** Get current Gross Salary from all earning element entries
+
+**When to Use:** For CTC, compensation reports
+
+```sql
+PAY_ENTRY_GROSS AS (
+    SELECT /*+ qb_name(PAY_ENT_GRS) MATERIALIZE */
+           PEEF.PERSON_ID
+          ,SUM(TO_NUMBER(PEEV.SCREEN_ENTRY_VALUE)) GROSS_AMOUNT
+    FROM   PAY_ELEMENT_TYPES_VL PETV
+          ,PAY_ELEMENT_ENTRIES_F PEEF
+          ,PAY_ELEMENT_ENTRY_VALUES_F PEEV
+          ,PAY_INPUT_VALUES_VL PIVL
+          ,PAY_ELE_CLASSIFICATIONS_TL PECT
+    WHERE  PETV.ELEMENT_TYPE_ID = PEEF.ELEMENT_TYPE_ID
+      AND  PEEF.ELEMENT_ENTRY_ID = PEEV.ELEMENT_ENTRY_ID
+      AND  PEEV.INPUT_VALUE_ID = PIVL.INPUT_VALUE_ID
+      AND  PETV.CLASSIFICATION_ID = PECT.CLASSIFICATION_ID
+      AND  PETV.PROCESSING_TYPE = 'R'
+      AND  UPPER(TRIM(PIVL.NAME)) = 'AMOUNT'
+      AND  PECT.LANGUAGE = 'US'
+      AND  UPPER(PECT.CLASSIFICATION_NAME) LIKE '%EARNING%'
+      AND  :P_DATE BETWEEN TRUNC(PEEF.EFFECTIVE_START_DATE) 
+                       AND TRUNC(PEEF.EFFECTIVE_END_DATE)
+      AND  :P_DATE BETWEEN TRUNC(PEEV.EFFECTIVE_START_DATE) 
+                       AND TRUNC(PEEV.EFFECTIVE_END_DATE)
+    GROUP BY PEEF.PERSON_ID
+)
+```
+
+---
+
+## 3. Accrual CTEs
+
+### 3.1 PAY_ACCRUAL_GRATUITY
+
+**Purpose:** Get gratuity accrual details from run results
+
+**When to Use:** For accrual reports, EOS calculations
+
+```sql
+PAY_ACCRUAL_GRATUITY AS (
+    SELECT /*+ qb_name(PAY_GRAT) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Accrual' 
+                    AND PIVTFB.NAME = 'Total Unpaid Leave Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) UNPAID_LEAVE_DAYS
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Accrual' 
+                    AND PIVTFB.NAME = 'Total Seniority Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) SENIORITY_DAYS
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Accrual' 
+                    AND PIVTFB.NAME = 'Service Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) SERVICE_DAYS
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Accrual' 
+                    AND PIVTFB.NAME = 'Monthly Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) MONTHLY_DAYS_ACCRUED
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Accrual' 
+                    AND PIVTFB.NAME = 'Monthly Amount' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) MONTHLY_AMOUNT_ACCRUED
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Accrual Payment' 
+                    AND PIVTFB.NAME = 'Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) DAYS_PAID
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Accrual Payment' 
+                    AND PIVTFB.NAME = 'Pay Value' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) AMOUNT_PAID
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Gain' 
+                    AND PIVTFB.NAME = 'Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) REVERSAL_DAYS
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Gratuity Gain' 
+                    AND PIVTFB.NAME = 'Amount' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) REVERSAL_AMOUNT
+    FROM   PAY_PAYROLL_ACTIONS PPA
+          ,PAY_PAYROLL_REL_ACTIONS PPRA
+          ,PAY_RUN_RESULTS PRRB
+          ,PAY_RUN_RESULT_VALUES PRRVB
+          ,PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_ELEMENT_TYPES_F PETFB
+          ,PAY_ELEMENT_TYPES_TL PETFT
+          ,PAY_INPUT_VALUES_F PIVFB
+          ,PAY_INPUT_VALUES_TL PIVTFB
+    WHERE  PPRA.PAYROLL_ACTION_ID = PPA.PAYROLL_ACTION_ID
+      AND  PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+      AND  PRRVB.RUN_RESULT_ID = PRRB.RUN_RESULT_ID
+      AND  PPRA.PAYROLL_RELATIONSHIP_ID = PPRD.PAYROLL_RELATIONSHIP_ID
+      AND  PPA.ACTION_TYPE IN ('Q', 'R')
+      AND  PPA.ACTION_STATUS IN ('C')
+      AND  PETFB.ELEMENT_TYPE_ID = PRRB.ELEMENT_TYPE_ID
+      AND  PETFB.ELEMENT_TYPE_ID = PETFT.ELEMENT_TYPE_ID
+      AND  PIVFB.ELEMENT_TYPE_ID = PETFB.ELEMENT_TYPE_ID
+      AND  PIVFB.INPUT_VALUE_ID = PRRVB.INPUT_VALUE_ID
+      AND  PIVFB.INPUT_VALUE_ID = PIVTFB.INPUT_VALUE_ID
+      AND  PPRA.RETRO_COMPONENT_ID IS NULL
+      AND  PETFT.LANGUAGE = 'US'
+      AND  PIVTFB.LANGUAGE = 'US'
+      AND  PETFT.REPORTING_NAME IN ('Gratuity Accrual', 'Gratuity Accrual Payment', 'Gratuity Gain')
+      AND  TRUNC(LAST_DAY(PPA.EFFECTIVE_DATE)) = :P_PERIOD_END
+    GROUP BY PPRD.PERSON_ID
+)
+```
+
+### 3.2 PAY_ACCRUAL_LEAVE
+
+**Purpose:** Get annual leave accrual details from run results
+
+**When to Use:** For leave balance reports, accrual reconciliation
+
+```sql
+PAY_ACCRUAL_LEAVE AS (
+    SELECT /*+ qb_name(PAY_LV_ACC) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Annual Leave Accrual' 
+                    AND PIVTFB.NAME = 'Days Eligible' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) AL_ELIGIBLE
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Annual Leave Accrual' 
+                    AND PIVTFB.NAME = 'Entitlement Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) AL_ENTITLEMENT
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Annual Leave Accrual' 
+                    AND PIVTFB.NAME = 'Monthly Days' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) AL_MONTHLY_DAYS
+          ,SUM(CASE WHEN PETFT.REPORTING_NAME = 'Annual Leave Accrual' 
+                    AND PIVTFB.NAME = 'Monthly Amount' 
+                    THEN TO_NUMBER(PRRVB.RESULT_VALUE) END) AL_MONTHLY_AMOUNT
+    FROM   PAY_PAYROLL_ACTIONS PPA
+          ,PAY_PAYROLL_REL_ACTIONS PPRA
+          ,PAY_RUN_RESULTS PRRB
+          ,PAY_RUN_RESULT_VALUES PRRVB
+          ,PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_ELEMENT_TYPES_F PETFB
+          ,PAY_ELEMENT_TYPES_TL PETFT
+          ,PAY_INPUT_VALUES_F PIVFB
+          ,PAY_INPUT_VALUES_TL PIVTFB
+    WHERE  PPRA.PAYROLL_ACTION_ID = PPA.PAYROLL_ACTION_ID
+      AND  PRRB.PAYROLL_REL_ACTION_ID = PPRA.PAYROLL_REL_ACTION_ID
+      AND  PRRVB.RUN_RESULT_ID = PRRB.RUN_RESULT_ID
+      AND  PPRA.PAYROLL_RELATIONSHIP_ID = PPRD.PAYROLL_RELATIONSHIP_ID
+      AND  PPA.ACTION_TYPE IN ('Q', 'R')
+      AND  PPA.ACTION_STATUS IN ('C')
+      AND  PETFB.ELEMENT_TYPE_ID = PRRB.ELEMENT_TYPE_ID
+      AND  PETFB.ELEMENT_TYPE_ID = PETFT.ELEMENT_TYPE_ID
+      AND  PIVFB.ELEMENT_TYPE_ID = PETFB.ELEMENT_TYPE_ID
+      AND  PIVFB.INPUT_VALUE_ID = PRRVB.INPUT_VALUE_ID
+      AND  PIVFB.INPUT_VALUE_ID = PIVTFB.INPUT_VALUE_ID
+      AND  PPRA.RETRO_COMPONENT_ID IS NULL
+      AND  PETFT.LANGUAGE = 'US'
+      AND  PIVTFB.LANGUAGE = 'US'
+      AND  PETFT.REPORTING_NAME = 'Annual Leave Accrual'
+      AND  TRUNC(LAST_DAY(PPA.EFFECTIVE_DATE)) = :P_PERIOD_END
+    GROUP BY PPRD.PERSON_ID
+)
+```
+
+---
+
+## 4. Payment Method CTEs
+
+### 4.1 PAY_BANK_ACCOUNT
+
+**Purpose:** Get employee bank account details
+
+**When to Use:** For bank transfer reports, payslip generation
+
+```sql
+PAY_BANK_ACCOUNT AS (
+    SELECT /*+ qb_name(PAY_BANK) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,PBA.BANK_ACCOUNT_NUMBER ACCOUNT_NUMBER
+          ,PBA.IBAN IBAN
+          ,PBA.BANK_NAME BANK_NAME
+          ,NVL(PPT.BASE_PAYMENT_TYPE_NAME,
+               NVL(PPPMF.NAME,
+                   NVL(POPM.ORG_PAYMENT_METHOD_NAME,
+                       PPT.PAYMENT_TYPE_NAME))) PAYMENT_METHOD
+    FROM   PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_PAYROLL_ASSIGNMENTS PPA
+          ,PAY_PERSONAL_PAYMENT_METHODS_F PPPMF
+          ,PAY_BANK_ACCOUNTS PBA
+          ,PAY_ORG_PAY_METHODS_VL POPM
+          ,PAY_PAYMENT_TYPES_VL PPT
+    WHERE  PPRD.PAYROLL_RELATIONSHIP_ID = PPA.PAYROLL_RELATIONSHIP_ID
+      AND  PPA.PAYROLL_RELATIONSHIP_ID = PPPMF.PAYROLL_RELATIONSHIP_ID
+      AND  PPPMF.BANK_ACCOUNT_ID = PBA.BANK_ACCOUNT_ID(+)
+      AND  PPPMF.ORG_PAYMENT_METHOD_ID = POPM.ORG_PAYMENT_METHOD_ID(+)
+      AND  POPM.PAYMENT_TYPE_ID = PPT.PAYMENT_TYPE_ID(+)
+      AND  :P_DATE BETWEEN TRUNC(PPPMF.EFFECTIVE_START_DATE) 
+                       AND TRUNC(PPPMF.EFFECTIVE_END_DATE)
+)
+```
+
+---
+
+## 5. Payroll Assignment CTEs
+
+### 5.1 PAY_ASSIGNMENT_PAYROLL
+
+**Purpose:** Get payroll name for person
+
+**When to Use:** For payroll grouping, filtering by payroll
+
+```sql
+PAY_ASG_PAYROLL AS (
+    SELECT /*+ qb_name(PAY_ASG_PR) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,PPRD.PAYROLL_RELATIONSHIP_NUMBER
+          ,PAP.PAYROLL_NAME
+          ,PAP.PAYROLL_ID
+    FROM   PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_REL_GROUPS_DN PRG
+          ,PAY_ASSIGNED_PAYROLLS_DN PAPD
+          ,PAY_ALL_PAYROLLS_F PAP
+    WHERE  PPRD.PAYROLL_RELATIONSHIP_ID = PRG.PAYROLL_RELATIONSHIP_ID
+      AND  PRG.RELATIONSHIP_GROUP_ID = PAPD.PAYROLL_TERM_ID
+      AND  PAPD.PAYROLL_ID = PAP.PAYROLL_ID
+      AND  TRUNC(SYSDATE) BETWEEN TRUNC(PAP.EFFECTIVE_START_DATE) 
+                              AND TRUNC(PAP.EFFECTIVE_END_DATE)
+)
+```
+
+---
+
+## 6. Balance CTEs (Advanced)
+
+### 6.1 PAY_BALANCE_YTD
+
+**Purpose:** Get Year-to-Date balances using Balance API
+
+**When to Use:** For balance inquiries, YTD totals
+
+```sql
+PAY_BALANCE_YTD AS (
+    SELECT /*+ qb_name(PAY_BAL_YTD) MATERIALIZE */
+           PPRD.PERSON_ID
+          ,PBT.BALANCE_NAME
+          ,TO_NUMBER(BAL.BALANCE_VALUE) BALANCE_VALUE_YTD
+    FROM   PAY_PAYROLL_REL_ACTIONS PPRA
+          ,PAY_PAYROLL_ACTIONS PPA
+          ,PAY_PAY_RELATIONSHIPS_DN PPRD
+          ,PAY_BALANCE_TYPES_VL PBT
+          ,TABLE(PAY_BALANCE_VIEW_PKG.GET_BALANCE_DIMENSIONS(
+                P_BALANCE_TYPE_ID => PBT.BALANCE_TYPE_ID,
+                P_PAYROLL_REL_ACTION_ID => PPRA.PAYROLL_REL_ACTION_ID,
+                P_PAYROLL_TERM_ID => NULL,
+                P_PAYROLL_ASSIGNMENT_ID => NULL
+            )) BAL
+          ,PAY_DIMENSION_USAGES_VL PDU
+    WHERE  PPA.PAYROLL_ACTION_ID = PPRA.PAYROLL_ACTION_ID
+      AND  PPRA.PAYROLL_RELATIONSHIP_ID = PPRD.PAYROLL_RELATIONSHIP_ID
+      AND  PPA.ACTION_TYPE IN ('Q', 'R')
+      AND  PPA.ACTION_STATUS IN ('C')
+      AND  PBT.BALANCE_NAME IN ('Air Fare Provision', 'DYR_Gratuity_Provision')
+      AND  PDU.DIMENSION_NAME = 'Assignment Inception to Date'
+      AND  PDU.BALANCE_DIMENSION_ID = BAL.BALANCE_DIMENSION_ID
+      AND  BAL.BALANCE_VALUE != '0'
+      AND  TRUNC(LAST_DAY(PPA.EFFECTIVE_DATE)) = :P_PERIOD_END
+)
+```
+
+---
+
+## 7. Time Period CTE
+
+### 7.1 PAY_PERIOD_DATES
+
+**Purpose:** Get period start/end dates for parameter filtering
+
+**When to Use:** For period filtering, date context
+
+```sql
+PAY_PERIOD_DATES AS (
+    SELECT /*+ qb_name(PAY_PER) MATERIALIZE */
+           PTP.TIME_PERIOD_ID
+          ,PTP.PERIOD_NAME
+          ,PTP.START_DATE
+          ,PTP.END_DATE
+          ,PAP.PAYROLL_NAME
+    FROM   PAY_TIME_PERIODS PTP
+          ,PAY_ALL_PAYROLLS_F PAP
+    WHERE  PTP.PAYROLL_ID = PAP.PAYROLL_ID
+      AND  TRUNC(LAST_DAY(PTP.END_DATE)) = :P_PERIOD_END
+)
+```
+
+---
+
+## 8. Flow Instance CTE (Dynamic Payroll)
+
+### 8.1 PAY_FLOW_INSTANCE
+
+**Purpose:** Get flow instance and consolidation set details
+
+**When to Use:** For dynamic payroll tracking
+
+```sql
+PAY_FLOW_INST AS (
+    SELECT /*+ qb_name(PAY_FLOW) MATERIALIZE */
+           PPA.PAYROLL_ACTION_ID
+          ,PFI.INSTANCE_NAME FLOW_INSTANCE_NAME
+          ,PCS.CONSOLIDATION_SET_NAME
+    FROM   PAY_PAYROLL_ACTIONS PPA
+          ,PAY_REQUESTS PRQ
+          ,PAY_FLOW_INSTANCES PFI
+          ,PAY_CONSOLIDATION_SETS PCS
+    WHERE  PPA.PAY_REQUEST_ID = PRQ.PAY_REQUEST_ID
+      AND  PRQ.FLOW_INSTANCE_ID = PFI.FLOW_INSTANCE_ID
+      AND  PPA.CONSOLIDATION_SET_ID = PCS.CONSOLIDATION_SET_ID
+      AND  PFI.INSTANCE_NAME = NVL(:P_FLOW_NAME, PFI.INSTANCE_NAME)
+      AND  PCS.CONSOLIDATION_SET_NAME = NVL(:P_CONSOLIDATE_SET, PCS.CONSOLIDATION_SET_NAME)
+)
+```
+
+---
+
+## 11. Enhanced Pattern CTEs (02-Jan-2026 Update)
+
+### 11.1 PARAMETERS CTE (With Effective Date Filtering)
+
+**Purpose:** Parameter handling with effective date support  
+**Usage:** For historical payroll queries
+
+```sql
+WITH PARAMETERS AS (
+    /*+ qb_name(PARAMETERS) */
+    SELECT
+        TRUNC(TO_DATE(:P_EFFECTIVE_DATE, 'DD-MON-YYYY')) AS EFFECTIVE_DATE,
+        TRUNC(LAST_DAY(TO_DATE(:P_PERIOD_END, 'DD-MON-YYYY'))) AS PERIOD_END,
+        UPPER(NVL(:P_ELEMENT_NAME, 'ALL')) AS ELEMENT_NAME,
+        UPPER(NVL(:P_PAYROLL_NAME, 'ALL')) AS PAYROLL_NAME,
+        UPPER(NVL(:P_CLASSIFICATION, 'ALL')) AS CLASSIFICATION
+    FROM DUAL
+)
+```
+
+**Benefits:**
+- Flexible date handling for historical queries
+- Case-insensitive parameter filtering
+- 'ALL' bypass for showing all elements/payrolls
+
+**Application in WHERE Clause:**
+```sql
+-- Effective date filtering
+AND P.EFFECTIVE_DATE BETWEEN PETF.EFFECTIVE_START_DATE AND PETF.EFFECTIVE_END_DATE
+AND P.EFFECTIVE_DATE BETWEEN PIVF.EFFECTIVE_START_DATE AND PIVF.EFFECTIVE_END_DATE
+
+-- Case-insensitive filters
+AND (UPPER(PETF.BASE_ELEMENT_NAME) = P.ELEMENT_NAME OR P.ELEMENT_NAME = 'ALL')
+AND (UPPER(PAP.PAYROLL_NAME) = P.PAYROLL_NAME OR P.PAYROLL_NAME = 'ALL')
+AND (UPPER(PEC.BASE_CLASSIFICATION_NAME) = P.CLASSIFICATION OR P.CLASSIFICATION = 'ALL')
+```
+
+---
+
+### 11.2 PAY_ENTRY_ELEMENTS_ENHANCED
+
+**Purpose:** Element entries with effective date support  
+**Usage:** For historical element assignment queries
+
+```sql
+PAY_ENTRY_ELEMENTS AS (
+    SELECT /*+ qb_name(PAY_ENTRY) MATERIALIZE */
+           PEEF.PERSON_ID,
+           PETV.BASE_ELEMENT_NAME,
+           PETV.ELEMENT_NAME,
+           TO_NUMBER(PEEV.SCREEN_ENTRY_VALUE) AS AMOUNT,
+           PEC.BASE_CLASSIFICATION_NAME
+    FROM
+        PAY_ELEMENT_TYPES_VL PETV,
+        PAY_ELEMENT_ENTRIES_F PEEF,
+        PAY_ELEMENT_ENTRY_VALUES_F PEEV,
+        PAY_INPUT_VALUES_VL PIVL,
+        PAY_ELE_CLASSIFICATIONS PEC,
+        PARAMETERS P
+    WHERE
+        PETV.ELEMENT_TYPE_ID = PEEF.ELEMENT_TYPE_ID
+    AND PEEF.ELEMENT_ENTRY_ID = PEEV.ELEMENT_ENTRY_ID
+    AND PEEV.INPUT_VALUE_ID = PIVL.INPUT_VALUE_ID
+    AND PETV.CLASSIFICATION_ID = PEC.CLASSIFICATION_ID
+    AND UPPER(TRIM(PIVL.NAME)) = 'AMOUNT'
+    -- Use Effective Date
+    AND P.EFFECTIVE_DATE BETWEEN PEEF.EFFECTIVE_START_DATE AND PEEF.EFFECTIVE_END_DATE
+    AND P.EFFECTIVE_DATE BETWEEN PEEV.EFFECTIVE_START_DATE AND PEEV.EFFECTIVE_END_DATE
+    -- Case-insensitive filter
+    AND (UPPER(PETV.BASE_ELEMENT_NAME) = P.ELEMENT_NAME OR P.ELEMENT_NAME = 'ALL')
+    AND (UPPER(PEC.BASE_CLASSIFICATION_NAME) = P.CLASSIFICATION OR P.CLASSIFICATION = 'ALL')
+)
+```
+
+---
+
+### 11.3 PAY_COMPONENT_BREAKDOWN
+
+**Purpose:** Show salary component breakdown for transparency  
+**Usage:** Payslips, salary statements, reconciliation
+
+```sql
+PAY_COMPONENT_BREAKDOWN AS (
+    SELECT /*+ qb_name(PAY_BREAKDOWN) */
+           PERSON_ID,
+           SUM(CASE WHEN ELEMENT_NAME = 'Basic Salary' THEN AMOUNT ELSE 0 END) AS BASIC,
+           SUM(CASE WHEN ELEMENT_NAME = 'Housing Allowance' THEN AMOUNT ELSE 0 END) AS HOUSING,
+           SUM(CASE WHEN ELEMENT_NAME = 'Transport Allowance' THEN AMOUNT ELSE 0 END) AS TRANSPORT,
+           SUM(CASE WHEN ELEMENT_NAME = 'Other Allowances' THEN AMOUNT ELSE 0 END) AS OTHER,
+           -- Calculated gross
+           SUM(CASE WHEN BASE_CLASSIFICATION_NAME = 'Standard Earnings' 
+               THEN AMOUNT ELSE 0 END) AS CALC_GROSS,
+           -- Deductions
+           SUM(CASE WHEN BASE_CLASSIFICATION_NAME IN ('Voluntary Deductions', 
+                                                       'Involuntary Deductions') 
+               THEN AMOUNT ELSE 0 END) AS TOTAL_DEDUCTIONS,
+           -- Calculated net
+           (SUM(CASE WHEN BASE_CLASSIFICATION_NAME = 'Standard Earnings' 
+                    THEN AMOUNT ELSE 0 END) -
+            SUM(CASE WHEN BASE_CLASSIFICATION_NAME IN ('Voluntary Deductions', 
+                                                        'Involuntary Deductions') 
+                    THEN AMOUNT ELSE 0 END)) AS CALC_NET_PAY
+    FROM PAY_RESULTS_MASTER
+    GROUP BY PERSON_ID
+)
+```
+
+**Benefits:**
+- Users can verify calculations
+- Transparent breakdown of gross/net
+- Easier troubleshooting
+
+---
+
+### 11.4 PAY_OPTIONAL_ACCRUALS
+
+**Purpose:** Handle optional/custom accrual tables  
+**Usage:** When client-specific tables may not exist
+
+```sql
+PAY_ACCRUAL_CUSTOM AS (
+    /*+ qb_name(PAY_ACCRUAL) */
+    SELECT
+        PERSON_ID,
+        ACCRUAL_AMOUNT,
+        ACCRUAL_TYPE
+    FROM CUSTOM_ACCRUAL_TABLE  -- May not exist in all environments
+    WHERE ACTIVE_FLAG = 'Y'
+)
+
+-- Use outer join in main query
+FROM
+    PAY_RESULTS_MASTER PRM,
+    PAY_ACCRUAL_CUSTOM PAC
+WHERE
+    PRM.PERSON_ID = PAC.PERSON_ID(+)
+
+-- Handle NULL in SELECT
+SELECT
+    PRM.PERSON_NUMBER,
+    NVL(PAC.ACCRUAL_AMOUNT, 0) AS CUSTOM_ACCRUAL
+FROM ...
+```
+
+**Documentation:**
+```sql
+/*
+ * OPTIONAL TABLES FOR PAYROLL
+ * ============================
+ * 1. CUSTOM_ACCRUAL_TABLE - Custom accrual tracking
+ *    - If missing, comment out PAY_ACCRUAL_CUSTOM CTE
+ *    - Accrual fields will show as 0
+ */
+```
+
+---
+
+## 🎯 Usage Example: Enhanced Element Entry Query
+
+```sql
+WITH PARAMETERS AS (
+    SELECT
+        TRUNC(TO_DATE(:P_EFFECTIVE_DATE, 'DD-MON-YYYY')) AS EFFECTIVE_DATE,
+        UPPER(NVL(:P_ELEMENT_NAME, 'ALL')) AS ELEMENT_NAME
+    FROM DUAL
+)
+,PAY_ENTRY_ELEMENTS AS (
+    SELECT
+        PEEF.PERSON_ID,
+        PETV.BASE_ELEMENT_NAME,
+        TO_NUMBER(PEEV.SCREEN_ENTRY_VALUE) AS AMOUNT
+    FROM
+        PAY_ELEMENT_TYPES_VL PETV,
+        PAY_ELEMENT_ENTRIES_F PEEF,
+        PAY_ELEMENT_ENTRY_VALUES_F PEEV,
+        PAY_INPUT_VALUES_VL PIVL,
+        PARAMETERS P
+    WHERE
+        PETV.ELEMENT_TYPE_ID = PEEF.ELEMENT_TYPE_ID
+    AND PEEF.ELEMENT_ENTRY_ID = PEEV.ELEMENT_ENTRY_ID
+    AND PEEV.INPUT_VALUE_ID = PIVL.INPUT_VALUE_ID
+    AND UPPER(TRIM(PIVL.NAME)) = 'AMOUNT'
+    -- Use Effective Date
+    AND P.EFFECTIVE_DATE BETWEEN PEEF.EFFECTIVE_START_DATE AND PEEF.EFFECTIVE_END_DATE
+    AND P.EFFECTIVE_DATE BETWEEN PEEV.EFFECTIVE_START_DATE AND PEEV.EFFECTIVE_END_DATE
+    -- Case-insensitive filter
+    AND (UPPER(PETV.BASE_ELEMENT_NAME) = P.ELEMENT_NAME OR P.ELEMENT_NAME = 'ALL')
+)
+SELECT * FROM PAY_ENTRY_ELEMENTS;
+```
+
+---
+
+## ⚠️ Critical Payroll Constraints (DO NOT CHANGE)
+
+These patterns must remain as-is:
+1. **ACTION_TYPE filtering:** `AND PPA.ACTION_TYPE IN ('Q', 'R')` - REQUIRED
+2. **ACTION_STATUS filtering:** `AND PPA.ACTION_STATUS IN ('C')` - REQUIRED
+3. **RETRO_COMPONENT exclusion:** `AND PPRA.RETRO_COMPONENT_ID IS NULL` - REQUIRED
+4. **INPUT_VALUE selection:** `AND PIVF.BASE_NAME = 'Pay Value'` - REQUIRED
+
+**The new patterns COMPLEMENT these, they do not replace them.**
+
+---
+
+**Last Updated:** 13-Jan-2026  
+**Version:** 2.0 (Merged with update file)  
+**Status:** Production-Ready  
+**Source:** 4 Production Payroll Queries

@@ -1,0 +1,315 @@
+# FA Report Templates
+
+**Purpose:** Ready-to-use SQL skeletons for FA reporting.
+
+---
+
+## 1. Asset Listing
+*List active assets with Cost.*
+
+```sql
+/*
+TITLE: Asset Listing
+PURPOSE: Audit active assets
+*/
+
+WITH
+-- 1. Assets
+ASSETS AS (
+    SELECT /*+ qb_name(A) MATERIALIZE */
+           FAB.ASSET_NUMBER, FAB.DESCRIPTION, FB.COST, FB.DATE_PLACED_IN_SERVICE
+    FROM   FA_ADDITIONS_B FAB, FA_BOOKS FB
+    WHERE  FAB.ASSET_ID = FB.ASSET_ID
+      AND  FB.BOOK_TYPE_CODE = :P_BOOK
+      AND  FB.TRANSACTION_HEADER_ID_OUT IS NULL
+)
+
+-- 2. Final Select
+SELECT A.ASSET_NUMBER
+      ,A.DESCRIPTION
+      ,A.COST
+      ,A.DATE_PLACED_IN_SERVICE
+FROM   ASSETS A
+ORDER BY A.ASSET_NUMBER
+```
+
+---
+
+## 2. Fixed Asset Register (Comprehensive)
+*Complete fixed asset register with depreciation, distribution, and GL details.*
+
+```sql
+/*
+TITLE: Fixed Asset Register (Comprehensive)
+PURPOSE: Complete asset register with depreciation and distribution details
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+-- Asset Master with Depreciation
+ASSET_DATA AS (
+    SELECT /*+ qb_name(ASSET_DATA) MATERIALIZE */
+           FAB.ASSET_ID
+          ,FAB.ASSET_NUMBER
+          ,FAT.DESCRIPTION ASSET_DESCRIPTION
+          ,FAB.TAG_NUMBER
+          ,FAB.ASSET_TYPE
+          -- Category Details
+          ,FCT.DESCRIPTION CATEGORY_DESCRIPTION
+          ,FC.SEGMENT1 CATEGORY_MAJOR
+          ,FC.SEGMENT2 CATEGORY_MINOR
+          -- Book Details
+          ,FB.BOOK_TYPE_CODE
+          ,FB.COST ASSET_COST
+          ,FB.ORIGINAL_COST
+          ,FB.DATE_PLACED_IN_SERVICE
+          ,FB.DATE_EFFECTIVE
+          ,FB.DEPRN_START_DATE
+          ,FB.LIFE_IN_MONTHS
+          ,FB.RECOVERABLE_COST
+          ,FB.SALVAGE_VALUE
+          -- Depreciation Method
+          ,FM.NAME DEPRECIATION_METHOD
+          ,FM.RATE DEPRECIATION_RATE
+          -- Depreciation Summary (Current Period)
+          ,FDS.DEPRN_RESERVE ACCUMULATED_DEPRECIATION
+          ,FDS.YTD_DEPRN YEAR_TO_DATE_DEPRECIATION
+          ,FDS.DEPRN_AMOUNT CURRENT_PERIOD_DEPRECIATION
+          ,FDS.PERIOD_NAME
+          ,FDS.FISCAL_YEAR
+          ,FB.COST - NVL(FDS.DEPRN_RESERVE, 0) NET_BOOK_VALUE
+          -- Remaining Life
+          ,CASE 
+             WHEN FB.LIFE_IN_MONTHS IS NOT NULL AND FB.DATE_PLACED_IN_SERVICE IS NOT NULL THEN
+               GREATEST(0, FB.LIFE_IN_MONTHS - 
+                 MONTHS_BETWEEN(TRUNC(SYSDATE), TRUNC(FB.DATE_PLACED_IN_SERVICE)))
+             ELSE NULL
+           END REMAINING_LIFE_MONTHS
+    FROM   FA_ADDITIONS_B FAB
+          ,FA_ADDITIONS_TL FAT
+          ,FA_BOOKS FB
+          ,FA_CATEGORIES_B FC
+          ,FA_CATEGORIES_TL FCT
+          ,FA_METHODS FM
+          ,FA_DEPRN_SUMMARY FDS
+    WHERE  FAB.ASSET_ID = FAT.ASSET_ID
+      AND  FAT.LANGUAGE = USERENV('LANG')
+      AND  FAB.ASSET_ID = FB.ASSET_ID
+      AND  FAB.ASSET_CATEGORY_ID = FC.CATEGORY_ID
+      AND  FC.CATEGORY_ID = FCT.CATEGORY_ID
+      AND  FCT.LANGUAGE = USERENV('LANG')
+      AND  FB.DEPRN_METHOD_CODE = FM.METHOD_ID(+)
+      AND  FB.ASSET_ID = FDS.ASSET_ID(+)
+      AND  FB.BOOK_TYPE_CODE = FDS.BOOK_TYPE_CODE(+)
+      AND  FDS.PERIOD_COUNTER(+) = (SELECT MAX(FDS2.PERIOD_COUNTER)
+                                     FROM   FA_DEPRN_SUMMARY FDS2
+                                     WHERE  FDS2.ASSET_ID = FB.ASSET_ID
+                                       AND  FDS2.BOOK_TYPE_CODE = FB.BOOK_TYPE_CODE
+                                       AND  FDS2.PERIOD_NAME <= :P_PERIOD)
+      AND  FB.BOOK_TYPE_CODE = :P_BOOK
+      AND  FB.TRANSACTION_HEADER_ID_OUT IS NULL
+      AND  FB.DATE_PLACED_IN_SERVICE BETWEEN NVL(:P_FROM_DATE, FB.DATE_PLACED_IN_SERVICE)
+                                         AND NVL(:P_TO_DATE, FB.DATE_PLACED_IN_SERVICE)
+),
+-- Asset Distribution
+ASSET_DIST AS (
+    SELECT /*+ qb_name(ASSET_DIST) */
+           FD.ASSET_ID
+          ,FD.DISTRIBUTION_ID
+          ,FD.UNITS_ASSIGNED
+          -- Location Details
+          ,FL.SEGMENT1 LOCATION_CODE
+          ,FL.DESCRIPTION LOCATION_DESCRIPTION
+          -- Employee Assignment
+          ,PPNF.DISPLAY_NAME EMPLOYEE_NAME
+          -- GL Account Details
+          ,GCCK_ASSET.CONCATENATED_SEGMENTS ASSET_ACCOUNT
+          ,GCCK_ASSET.SEGMENT1 COMPANY_CODE
+          ,GCCK_ASSET.SEGMENT2 ACCOUNT_CODE
+          ,GCCK_ASSET.SEGMENT3 COST_CENTER_CODE
+          ,GCCK_DEPRN.CONCATENATED_SEGMENTS DEPRN_ACCOUNT
+          ,GCCK_EXP.CONCATENATED_SEGMENTS EXPENSE_ACCOUNT
+          -- Distribution Percentage
+          ,(FD.UNITS_ASSIGNED / NULLIF(
+               (SELECT SUM(FD2.UNITS_ASSIGNED)
+                FROM   FA_DISTRIBUTION_HISTORY FD2
+                WHERE  FD2.ASSET_ID = FD.ASSET_ID
+                  AND  FD2.BOOK_TYPE_CODE = FD.BOOK_TYPE_CODE
+                  AND  FD2.DATE_INEFFECTIVE IS NULL), 0)) * 100 DISTRIBUTION_PCT
+          -- Row Number for handling multiple distributions
+          ,ROW_NUMBER() OVER (PARTITION BY FD.ASSET_ID ORDER BY FD.DISTRIBUTION_ID) RN
+    FROM   FA_DISTRIBUTION_HISTORY FD
+          ,FA_LOCATIONS FL
+          ,GL_CODE_COMBINATIONS_KFV GCCK_ASSET
+          ,GL_CODE_COMBINATIONS_KFV GCCK_DEPRN
+          ,GL_CODE_COMBINATIONS_KFV GCCK_EXP
+          ,PER_PERSON_NAMES_F PPNF
+    WHERE  FD.LOCATION_ID = FL.LOCATION_ID(+)
+      AND  FD.CODE_COMBINATION_ID = GCCK_ASSET.CODE_COMBINATION_ID(+)
+      AND  FD.DEPRN_RESERVE_CCID = GCCK_DEPRN.CODE_COMBINATION_ID(+)
+      AND  FD.DEPRN_EXPENSE_CCID = GCCK_EXP.CODE_COMBINATION_ID(+)
+      AND  FD.ASSIGNED_TO = PPNF.PERSON_ID(+)
+      AND  PPNF.NAME_TYPE(+) = 'GLOBAL'
+      AND  TRUNC(SYSDATE) BETWEEN TRUNC(PPNF.EFFECTIVE_START_DATE(+)) 
+                              AND TRUNC(PPNF.EFFECTIVE_END_DATE(+))
+      AND  FD.DATE_INEFFECTIVE IS NULL
+      AND  FD.BOOK_TYPE_CODE = :P_BOOK
+)
+-- Final Selection
+SELECT AD.ASSET_NUMBER
+      ,AD.ASSET_DESCRIPTION
+      ,AD.TAG_NUMBER
+      ,AD.ASSET_TYPE
+      ,AD.CATEGORY_DESCRIPTION
+      ,AD.CATEGORY_MAJOR
+      ,AD.CATEGORY_MINOR
+      ,AD.BOOK_TYPE_CODE
+      ,AD.DATE_PLACED_IN_SERVICE
+      ,AD.DEPRN_START_DATE
+      ,AD.DEPRECIATION_METHOD
+      ,AD.LIFE_IN_MONTHS
+      ,AD.REMAINING_LIFE_MONTHS
+      ,AD.DEPRECIATION_RATE
+      -- Cost Details
+      ,AD.ORIGINAL_COST
+      ,AD.ASSET_COST
+      ,AD.SALVAGE_VALUE
+      ,AD.RECOVERABLE_COST
+      -- Depreciation Details
+      ,AD.ACCUMULATED_DEPRECIATION
+      ,AD.NET_BOOK_VALUE
+      ,AD.YEAR_TO_DATE_DEPRECIATION
+      ,AD.CURRENT_PERIOD_DEPRECIATION
+      ,AD.PERIOD_NAME
+      ,AD.FISCAL_YEAR
+      -- Distribution Details
+      ,ASST_D.LOCATION_CODE
+      ,ASST_D.LOCATION_DESCRIPTION
+      ,ASST_D.EMPLOYEE_NAME
+      ,ASST_D.DISTRIBUTION_PCT
+      -- GL Account Details
+      ,ASST_D.ASSET_ACCOUNT
+      ,ASST_D.DEPRN_ACCOUNT
+      ,ASST_D.EXPENSE_ACCOUNT
+      ,ASST_D.COMPANY_CODE
+      ,ASST_D.ACCOUNT_CODE
+      ,ASST_D.COST_CENTER_CODE
+FROM   ASSET_DATA AD
+      ,ASSET_DIST ASST_D
+WHERE  AD.ASSET_ID = ASST_D.ASSET_ID(+)
+  AND  ASST_D.RN(+) = 1  -- Primary distribution only
+  AND  (AD.CATEGORY_MAJOR IN (:P_CATEGORY) OR 'All' IN (:P_CATEGORY || 'All'))
+  AND  (ASST_D.LOCATION_CODE IN (:P_LOCATION) OR 'All' IN (:P_LOCATION || 'All'))
+ORDER BY AD.CATEGORY_MAJOR, AD.ASSET_NUMBER
+```
+
+---
+
+## 3. Asset Depreciation Schedule
+*Period-by-period depreciation tracking.*
+
+```sql
+/*
+TITLE: Asset Depreciation Schedule
+PURPOSE: Detailed depreciation by period for analysis
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+DEPRN_DATA AS (
+    SELECT /*+ qb_name(DEPRN_DATA) MATERIALIZE */
+           FDS.ASSET_ID
+          ,FAB.ASSET_NUMBER
+          ,FAT.DESCRIPTION ASSET_DESCRIPTION
+          ,FDS.BOOK_TYPE_CODE
+          ,FDS.PERIOD_NAME
+          ,FDS.PERIOD_COUNTER
+          ,FDS.FISCAL_YEAR
+          -- Depreciation Amounts
+          ,FDS.DEPRN_AMOUNT PERIOD_DEPRECIATION
+          ,FDS.YTD_DEPRN YTD_DEPRECIATION
+          ,FDS.DEPRN_RESERVE ACCUMULATED_DEPRECIATION
+          -- Cost and NBV
+          ,FDS.COST ASSET_COST
+          ,FDS.COST - FDS.DEPRN_RESERVE NET_BOOK_VALUE
+          -- Adjustments
+          ,FDS.ADJUSTMENT_AMOUNT
+          ,FDS.BONUS_DEPRN_AMOUNT
+          -- Period Details
+          ,FDP.PERIOD_OPEN_DATE
+          ,FDP.PERIOD_CLOSE_DATE
+          ,FDP.DEPRECIATION_DATE
+    FROM   FA_DEPRN_SUMMARY FDS
+          ,FA_DEPRN_PERIODS FDP
+          ,FA_ADDITIONS_B FAB
+          ,FA_ADDITIONS_TL FAT
+    WHERE  FDS.BOOK_TYPE_CODE = FDP.BOOK_TYPE_CODE
+      AND  FDS.PERIOD_COUNTER = FDP.PERIOD_COUNTER
+      AND  FDS.ASSET_ID = FAB.ASSET_ID
+      AND  FAB.ASSET_ID = FAT.ASSET_ID
+      AND  FAT.LANGUAGE = USERENV('LANG')
+      AND  FDS.BOOK_TYPE_CODE = :P_BOOK
+      AND  FDS.FISCAL_YEAR = :P_FISCAL_YEAR
+      AND  (FAB.ASSET_NUMBER IN (:P_ASSET_NUM) OR 'All' IN (:P_ASSET_NUM || 'All'))
+)
+SELECT * FROM DEPRN_DATA
+ORDER BY ASSET_NUMBER, PERIOD_COUNTER
+```
+
+---
+
+## 4. Asset Retirement Report
+*Tracks retired/disposed assets with gain/loss.*
+
+```sql
+/*
+TITLE: Asset Retirement Report
+PURPOSE: Analysis of disposed assets with financial impact
+AUTHOR: AI Generation Code
+DATE: 22-12-25
+*/
+
+WITH 
+RETIREMENT_DATA AS (
+    SELECT /*+ qb_name(RET_DATA) MATERIALIZE */
+           FAB.ASSET_NUMBER
+          ,FAT.DESCRIPTION ASSET_DESCRIPTION
+          ,FAB.TAG_NUMBER
+          ,FCT.DESCRIPTION CATEGORY_DESCRIPTION
+          ,FR.DATE_RETIRED
+          ,FR.DATE_EFFECTIVE
+          ,FR.RETIREMENT_TYPE_CODE
+          ,FR.STATUS RETIREMENT_STATUS
+          -- Cost and Depreciation
+          ,FR.COST_RETIRED ORIGINAL_COST
+          ,FR.COST_RETIRED - FR.NBV_RETIRED ACCUMULATED_DEPRECIATION
+          ,FR.NBV_RETIRED NET_BOOK_VALUE
+          -- Sale Details
+          ,FR.PROCEEDS_OF_SALE SALE_PROCEEDS
+          ,FR.GAIN_LOSS_AMOUNT
+          ,CASE 
+             WHEN FR.GAIN_LOSS_AMOUNT > 0 THEN 'Gain'
+             WHEN FR.GAIN_LOSS_AMOUNT < 0 THEN 'Loss'
+             ELSE 'No Gain/Loss'
+           END GAIN_LOSS_TYPE
+    FROM   FA_RETIREMENTS FR
+          ,FA_ADDITIONS_B FAB
+          ,FA_ADDITIONS_TL FAT
+          ,FA_CATEGORIES_B FC
+          ,FA_CATEGORIES_TL FCT
+    WHERE  FR.ASSET_ID = FAB.ASSET_ID
+      AND  FAB.ASSET_ID = FAT.ASSET_ID
+      AND  FAT.LANGUAGE = USERENV('LANG')
+      AND  FAB.ASSET_CATEGORY_ID = FC.CATEGORY_ID
+      AND  FC.CATEGORY_ID = FCT.CATEGORY_ID
+      AND  FCT.LANGUAGE = USERENV('LANG')
+      AND  FR.BOOK_TYPE_CODE = :P_BOOK
+      AND  FR.STATUS = 'PROCESSED'
+      AND  TRUNC(FR.DATE_RETIRED) BETWEEN NVL(:P_FROM_DATE, TRUNC(FR.DATE_RETIRED))
+                                      AND NVL(:P_TO_DATE, TRUNC(FR.DATE_RETIRED))
+)
+SELECT * FROM RETIREMENT_DATA
+ORDER BY DATE_RETIRED, ASSET_NUMBER
+```

@@ -1,0 +1,373 @@
+# AP Repository Patterns
+
+**Purpose:** Standardized Common Table Expressions (CTEs) for extracting AP data.
+**Critical Rule:** Copy-paste these blocks exactly to maintain compliance.
+
+---
+
+## 1. Invoice Master Repository
+*Retrieves active invoices with Supplier and Organization details.*
+
+```sql
+AP_INV_MASTER AS (
+    SELECT /*+ qb_name(AP_INV_MASTER) MATERIALIZE PARALLEL(2) */
+           AIA.INVOICE_ID
+          ,AIA.INVOICE_NUM
+          ,AIA.INVOICE_DATE
+          ,AIA.INVOICE_AMOUNT
+          ,AIA.INVOICE_CURRENCY_CODE
+          ,AIA.ORG_ID
+          ,POS.VENDOR_NAME AS SUPPLIER_NAME
+          ,PSS.VENDOR_SITE_CODE AS SITE_CODE
+    FROM   AP_INVOICES_ALL AIA
+          ,POZ_SUPPLIERS_V POS
+          ,POZ_SUPPLIER_SITES_V PSS
+    WHERE  AIA.CANCELLED_DATE IS NULL
+      AND  AIA.VENDOR_ID = POS.VENDOR_ID
+      AND  AIA.VENDOR_SITE_ID = PSS.VENDOR_SITE_ID
+      AND  AIA.ORG_ID = PSS.PRC_BU_ID
+      AND  (AIA.ORG_ID IN (:P_BU_ID) OR 'All' IN (:P_BU_ID || 'All'))
+)
+```
+
+---
+
+## 2. Invoice Distributions (Detailed)
+*Retrieves distribution level details including GL Accounts.*
+
+```sql
+AP_INV_DIST AS (
+    SELECT /*+ qb_name(AP_INV_DIST) MATERIALIZE */
+           AID.INVOICE_ID
+          ,AID.INVOICE_DISTRIBUTION_ID
+          ,AID.DISTRIBUTION_LINE_NUMBER
+          ,AID.AMOUNT
+          ,GCC.SEGMENT1 AS GL_COMPANY
+          ,GCC.SEGMENT2 AS GL_ACCOUNT
+          ,GCC.CODE_COMBINATION_ID
+    FROM   AP_INVOICE_DISTRIBUTIONS_ALL AID
+          ,GL_CODE_COMBINATIONS GCC
+    WHERE  AID.DIST_CODE_COMBINATION_ID = GCC.CODE_COMBINATION_ID
+      AND  NVL(AID.REVERSAL_FLAG, 'N') = 'N'
+)
+```
+
+---
+
+## 3. Payment Master
+*Retrieves valid payments.*
+
+```sql
+AP_PAY_MASTER AS (
+    SELECT /*+ qb_name(AP_PAY_MASTER) MATERIALIZE */
+           ACA.CHECK_ID
+          ,ACA.CHECK_NUMBER
+          ,ACA.CHECK_DATE
+          ,ACA.AMOUNT
+          ,ACA.STATUS_LOOKUP_CODE
+    FROM   AP_CHECKS_ALL ACA
+    WHERE  ACA.VOID_DATE IS NULL
+      AND  ACA.ORG_ID IN (:P_BU_ID)
+)
+```
+
+---
+
+## 4. Payment Schedules (Aging Source)
+*Retrieves open or closed schedules for Aging calculations.*
+
+```sql
+AP_SCHED_MASTER AS (
+    SELECT /*+ qb_name(AP_SCHED) MATERIALIZE */
+           PSA.INVOICE_ID
+          ,PSA.PAYMENT_NUM
+          ,PSA.DUE_DATE
+          ,PSA.AMOUNT_REMAINING
+          ,TRUNC(:P_RPT_DATE) - TRUNC(PSA.DUE_DATE) AS DAYS_OVERDUE
+    FROM   AP_PAYMENT_SCHEDULES_ALL PSA
+    WHERE  ((PSA.AMOUNT_REMAINING != 0) OR (:P_SHOW_PAID = 'Y'))
+)
+```
+
+---
+
+## 5. Prepayment Applications
+*Tracks prepayment usage and links to standard invoices.*
+
+```sql
+AP_PREPAY_APP AS (
+    SELECT /*+ qb_name(AP_PREPAY) MATERIALIZE */
+           AIPP.PREPAYMENT_ID
+          ,AIPP.INVOICE_ID
+          ,AIPP.PREPAY_AMOUNT_APPLIED
+          ,AIPP.PREPAY_AMOUNT_REMAINING
+    FROM   AP_INVOICE_PREPAYMENTS_ALL AIPP
+          ,AP_INVOICES_ALL AIA
+    WHERE  AIPP.INVOICE_ID = AIA.INVOICE_ID
+      AND  AIA.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT'
+      AND  NVL(AIPP.REVERSAL_FLAG, 'N') = 'N'
+)
+```
+
+---
+
+## 6. Holds Master
+*Tracks active and released holds.*
+
+```sql
+AP_HOLDS_MASTER AS (
+    SELECT /*+ qb_name(AP_HOLDS) MATERIALIZE */
+           AH.INVOICE_ID
+          ,AH.HOLD_LOOKUP_CODE
+          ,AH.HOLD_REASON
+          ,AH.HOLD_DATE
+          ,AH.RELEASE_LOOKUP_CODE
+    FROM   AP_HOLDS_ALL AH
+    WHERE  (:P_ACTIVE_ONLY = 'N' OR AH.RELEASE_LOOKUP_CODE IS NULL)
+)
+```
+
+---
+
+## 7. Subledger Accounting (XLA)
+*Links AP Distributions to GL Journal Entries. CRITICAL for reconciliation.*
+
+```sql
+AP_XLA_MASTER AS (
+    SELECT /*+ qb_name(AP_XLA) MATERIALIZE */
+           XDL.SOURCE_DISTRIBUTION_ID_NUM_1 AS INVOICE_DIST_ID
+          ,XAL.ACCOUNTED_DR
+          ,XAL.ACCOUNTED_CR
+          ,XAL.ACCOUNTING_CLASS_CODE
+          ,XAH.JE_CATEGORY_NAME
+    FROM   XLA_AE_HEADERS XAH
+          ,XLA_AE_LINES XAL
+          ,XLA_DISTRIBUTION_LINKS XDL
+    WHERE  XAH.AE_HEADER_ID = XAL.AE_HEADER_ID
+      AND  XAL.AE_HEADER_ID = XDL.AE_HEADER_ID
+      AND  XAL.AE_LINE_NUM = XDL.AE_LINE_NUM
+      AND  XDL.SOURCE_DISTRIBUTION_TYPE = 'AP_INV_DIST'
+      AND  XAH.APPLICATION_ID = 200
+      AND  XAL.APPLICATION_ID = 200
+      AND  XDL.APPLICATION_ID = 200
+)
+```
+
+---
+
+## 8. Supplier Master (Standalone)
+*For Supplier utilization reports.*
+
+```sql
+AP_SUPPLIER_MASTER AS (
+    SELECT /*+ qb_name(AP_SUPP) MATERIALIZE */
+           PSV.VENDOR_ID
+          ,PSV.VENDOR_NAME
+          ,PSV.SEGMENT1 AS VENDOR_NUM
+          ,PSV.VENDOR_TYPE_LOOKUP_CODE
+          ,PSSV.VENDOR_SITE_CODE
+    FROM   POZ_SUPPLIERS_V PSV
+          ,POZ_SUPPLIER_SITES_V PSSV
+    WHERE  PSV.VENDOR_ID = PSSV.VENDOR_ID
+)
+```
+
+---
+
+## 9. Invoice Master with Validation Status
+*Complete invoice details with validation and accounting status.*
+
+```sql
+APINV_TRX AS (
+    SELECT /*+ qb_name(APINV_TRX) */
+           AIA.ORG_ID
+          ,AIA.INVOICE_ID
+          ,AIA.INVOICE_NUM
+          ,AIA.INVOICE_DATE
+          ,AIA.INVOICE_RECEIVED_DATE
+          ,AIA.DOC_SEQUENCE_VALUE VOUCHER_NUM
+          ,AIA.VENDOR_ID
+          ,AIA.VENDOR_SITE_ID
+          ,AIA.PARTY_ID
+          ,AIA.INVOICE_TYPE_LOOKUP_CODE INVOICE_TYPE_CODE
+          ,ALC.DISPLAYED_FIELD INVOICE_TYPE
+          ,AIA.INVOICE_CURRENCY_CODE CURRENCY_CODE
+          ,NVL(AIA.EXCHANGE_RATE, 1) EXCHANGE_RATE
+          ,DECODE (AIA.APPROVAL_STATUS,
+                   'FULL', 'FULLY APPLIED',
+                   'NEVER APPROVED', 'NEVER VALIDATED',
+                   'NEEDS REAPPROVAL', 'NEEDS REVALIDATION',
+                   'CANCELLED', 'CANCELLED',
+                   'UNPAID', 'UNPAID',
+                   'AVAILABLE', 'AVAILABLE',
+                   'UNAPPROVED', 'UNVALIDATED',
+                   'APPROVED', 'VALIDATED',
+                   'PERMANENT', 'PERMANENT PREPAYMENT',
+                   NULL
+           ) VALIDATION_STATUS
+          ,AP_INVOICES_UTILITY_PKG.GET_ACCOUNTING_STATUS(AIA.INVOICE_ID) ACCOUNTING_STATUS
+          ,AIA.ACCTS_PAY_CODE_COMBINATION_ID CODE_COMBINATION_ID
+          ,REPLACE(REPLACE(AIA.DESCRIPTION,CHR(10),' '),CHR(9),' ') INVOICE_DESC
+          ,MAX(AID.ACCOUNTING_DATE) GL_DATE
+          ,SUM(AID.AMOUNT) INVOICE_AMOUNT
+          ,SUM(AID.AMOUNT * NVL(AIA.EXCHANGE_RATE, 1)) INVOICE_AMOUNT_F
+          ,ATV.NAME TERM_NAME
+    FROM   AP_INVOICES_ALL AIA
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AID
+          ,AP_LOOKUP_CODES ALC
+          ,AP_TERMS_VL ATV
+    WHERE  AIA.INVOICE_ID = AID.INVOICE_ID
+      AND  AIA.TERMS_ID = ATV.TERM_ID(+)
+      AND  AIA.INVOICE_TYPE_LOOKUP_CODE = ALC.LOOKUP_CODE(+)
+      AND  ALC.LOOKUP_TYPE(+) = 'INVOICE TYPE'
+      AND  AID.LINE_TYPE_LOOKUP_CODE <> 'PREPAY'
+      AND  TRUNC(AID.ACCOUNTING_DATE) <= :P_DATE
+      AND  AIA.CANCELLED_DATE IS NULL
+    GROUP BY AIA.ORG_ID, AIA.INVOICE_ID, AIA.INVOICE_NUM, AIA.INVOICE_DATE,
+             AIA.INVOICE_RECEIVED_DATE, AIA.DOC_SEQUENCE_VALUE, AIA.VENDOR_ID,
+             AIA.VENDOR_SITE_ID, AIA.PARTY_ID, AIA.INVOICE_TYPE_LOOKUP_CODE,
+             ALC.DISPLAYED_FIELD, AIA.INVOICE_CURRENCY_CODE, NVL(AIA.EXCHANGE_RATE, 1),
+             AIA.ACCTS_PAY_CODE_COMBINATION_ID, AIA.DESCRIPTION, ATV.NAME, AIA.APPROVAL_STATUS
+    HAVING SUM(AID.AMOUNT) <> 0
+)
+```
+
+---
+
+## 10. Payment Schedule with Paid Amounts
+*Tracks due dates and payment amounts applied.*
+
+```sql
+APPAY_TRX AS (
+    SELECT /*+ qb_name(APPAY_TRX) */
+           APS.INVOICE_ID
+          ,APS.PAYMENT_NUM
+          ,TRUNC(APS.DUE_DATE) DUE_DATE
+          ,(TO_DATE(:P_DATE,'DDMMYYYY') - APS.DUE_DATE) DUE_DAYS
+          ,APS.GROSS_AMOUNT INVOICE_AMOUNT
+          ,SUM(CASE WHEN (AIP.ACCOUNTING_DATE <= :P_DATE) 
+               THEN (NVL(AIP.AMOUNT_INV_CURR, 0) + NVL(AIP.DISCOUNT_TAKEN_INV_CURR, 0)) 
+               ELSE 0 END) PAID_AMOUNT
+          ,SUM(CASE WHEN (AIP.ACCOUNTING_DATE <= :P_DATE) 
+               THEN (NVL(AIP.AMOUNT, 0) + NVL(AIP.DISCOUNT_TAKEN, 0)) 
+               ELSE 0 END) PAID_AMOUNT_F
+    FROM   AP_PAYMENT_SCHEDULES_ALL APS
+          ,AP_INVOICE_PAYMENTS_ALL AIP
+    WHERE  APS.INVOICE_ID = AIP.INVOICE_ID(+)
+      AND  APS.PAYMENT_NUM = AIP.PAYMENT_NUM(+)
+    GROUP BY APS.INVOICE_ID, APS.PAYMENT_NUM, TRUNC(APS.DUE_DATE),
+             (TO_DATE(:P_DATE,'DDMMYYYY') - APS.DUE_DATE), APS.GROSS_AMOUNT
+)
+```
+
+---
+
+## 11. Prepayment Applications Detailed
+*Tracks prepayment usage and application to standard invoices.*
+
+```sql
+PREPAY_TRX AS (
+    SELECT /*+ qb_name(PREPAY_TRX) */
+           AIAP.INVOICE_ID
+          ,AIAP.INVOICE_NUM
+          ,AIAI.INVOICE_ID APP_INVOICE_ID
+          ,AIAI.INVOICE_NUM APP_INVOICE_NUM
+          ,AIAI.INVOICE_DATE APP_INVOICE_DATE
+          ,ABS(SUM(AIDI.AMOUNT)) APP_AMOUNT
+          ,NVL(AIAP.EXCHANGE_RATE,1) EXCHANGE_RATE
+          ,NVL(AIAI.EXCHANGE_RATE,1) APP_EXC_RATE
+    FROM   AP_INVOICES_ALL AIAP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDP
+          ,AP_INVOICE_DISTRIBUTIONS_ALL AIDI
+          ,AP_INVOICES_ALL AIAI
+    WHERE  AIAP.INVOICE_ID = AIDP.INVOICE_ID
+      AND  AIDP.INVOICE_DISTRIBUTION_ID = AIDI.PREPAY_DISTRIBUTION_ID
+      AND  AIDI.INVOICE_ID = AIAI.INVOICE_ID
+      AND  AIAP.INVOICE_TYPE_LOOKUP_CODE = 'PREPAYMENT'
+      AND  AIDI.REVERSAL_FLAG = 'N'
+      AND  AIAP.CANCELLED_DATE IS NULL
+      AND  TRUNC(AIDI.ACCOUNTING_DATE) <= :P_DATE
+    GROUP BY AIAP.INVOICE_ID, AIAP.INVOICE_NUM, AIAI.INVOICE_ID, 
+             AIAI.INVOICE_NUM, AIAI.INVOICE_DATE, 
+             NVL(AIAP.EXCHANGE_RATE,1), NVL(AIAI.EXCHANGE_RATE,1)
+)
+```
+
+---
+
+## 12. Approval History
+*Retrieves latest approver information for invoices.*
+
+```sql
+APPROVER AS (
+    SELECT /*+ qb_name(APPROVER) */
+           MAX(AIAHA.ACTION_DATE) APPROVAL_DATE
+          ,MAX(PPNF.DISPLAY_NAME) APPROVER_NAME
+          ,AIAHA.INVOICE_ID
+    FROM   AP_INV_APRVL_HIST_ALL AIAHA
+          ,PER_USERS PU
+          ,PER_PERSON_NAMES_F PPNF
+    WHERE  AIAHA.APPROVER_ID = PU.USERNAME(+)
+      AND  PU.PERSON_ID = PPNF.PERSON_ID(+)
+      AND  PPNF.NAME_TYPE (+) = 'GLOBAL'
+      AND  AIAHA.RESPONSE = 'APPROVED'
+      AND  TRUNC(SYSDATE) BETWEEN TRUNC(PPNF.EFFECTIVE_START_DATE(+)) 
+                              AND TRUNC(PPNF.EFFECTIVE_END_DATE(+))
+    GROUP BY AIAHA.INVOICE_ID
+)
+```
+
+---
+
+## 13. SLA Reconciliation View
+*Links AP distributions to subledger accounting for reconciliation.*
+
+```sql
+AP_SLA_RECON AS (
+    SELECT /*+ qb_name(AP_SLA_RECON) */
+           XTE.SOURCE_ID_INT_1 INVOICE_ID
+          ,SUM(XAL.ENTERED_CR) ENTERED_CR
+          ,SUM(XAL.ENTERED_DR) ENTERED_DR
+          ,SUM(XAL.ACCOUNTED_CR) ACCOUNTED_CR
+          ,SUM(XAL.ACCOUNTED_DR) ACCOUNTED_DR
+    FROM   XLA_AE_HEADERS XAH
+          ,XLA_AE_LINES XAL
+          ,XLA_TRANSACTION_ENTITIES XTE
+    WHERE  XAH.AE_HEADER_ID = XAL.AE_HEADER_ID
+      AND  XAH.APPLICATION_ID = XAL.APPLICATION_ID
+      AND  XAH.APPLICATION_ID = XTE.APPLICATION_ID
+      AND  XAH.ENTITY_ID = XTE.ENTITY_ID
+      AND  XAL.ACCOUNTING_CLASS_CODE IN('PREPAID_EXPENSE','LIABILITY')
+      AND  XTE.ENTITY_CODE = 'AP_INVOICES'
+      AND  XAH.APPLICATION_ID = 200
+      AND  TRUNC(XAL.ACCOUNTING_DATE) <= :P_DATE
+    GROUP BY XTE.SOURCE_ID_INT_1
+)
+```
+
+---
+
+## 14. Party-Based Supplier Resolution
+*Handles both standard and party-based suppliers.*
+
+```sql
+AP_PARTY_SUPPLIER AS (
+    SELECT /*+ qb_name(AP_PARTY_SUPP) */
+           AIA.INVOICE_ID
+          ,NVL(POS.VENDOR_NAME, 
+               (SELECT party_name FROM hz_parties WHERE PARTY_ID = AIA.PARTY_ID)) SUPPLIER_NAME
+          ,NVL(POS.SEGMENT1, 
+               (SELECT party_number FROM hz_parties WHERE PARTY_ID = AIA.PARTY_ID)) SUPPLIER_NUM
+          ,NVL(PSS.VENDOR_SITE_CODE,
+               (SELECT PARTY_SITE_NAME FROM HZ_PARTY_SITES 
+                WHERE party_site_id = AIA.party_site_id 
+                  AND STATUS='A' 
+                  AND TRUNC(SYSDATE) BETWEEN TRUNC(START_DATE_ACTIVE) 
+                                         AND TRUNC(END_DATE_ACTIVE))) VENDOR_SITE_CODE
+    FROM   AP_INVOICES_ALL AIA
+          ,POZ_SUPPLIERS_V POS
+          ,POZ_SUPPLIER_SITES_V PSS
+    WHERE  AIA.VENDOR_ID = POS.VENDOR_ID(+)
+      AND  AIA.VENDOR_SITE_ID = PSS.VENDOR_SITE_ID(+)
+)
+```
