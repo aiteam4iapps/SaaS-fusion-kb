@@ -4,7 +4,6 @@ module: ADMIN
 version: 1.0.0
 last_updated: 2025-12-12
 ---
-
 # Knowledge Base Governance & Access Control
 
 **Purpose:** Define strategies to centralize the SQL Knowledge Base, enforce standards through Role-Based Access Control (RBAC), and manage distribution.
@@ -17,8 +16,8 @@ last_updated: 2025-12-12
 
 The Knowledge Base (KB) must reside in a version-controlled **Git Repository** (e.g., GitHub, GitLab). This ensures:
 
-- **Version History:** Who changed a standard and when.
-- **Review Process:** Changes require approval via Pull Requests (PR).
+* **Version History:** Who changed a standard and when.
+* **Review Process:** Changes require approval via Pull Requests (PR).
 
 ---
 
@@ -26,8 +25,8 @@ The Knowledge Base (KB) must reside in a version-controlled **Git Repository** (
 
 ### The "Source of Truth" vs. "Consumption"
 
-- **Git (Source of Truth):** Perfect for Control.
-- **ByteRover / Openmemory (Consumption):** Perfect for Access.
+* **Git (Source of Truth):** Perfect for Control.
+* **ByteRover / Openmemory (Consumption):** Perfect for Access.
 
 ### 🚀 Recommended Architecture: The "Push" Model
 
@@ -35,7 +34,7 @@ The Knowledge Base (KB) must reside in a version-controlled **Git Repository** (
 2. **Read Layer (AI Memory):** On merge, CI/CD pushes content to ByteRover.
 
 > [!IMPORTANT]
-> **Do NOT edit directly in ByteRover.** Treat the Memory Store as a _ReadOnly Cache_ of the Git repository.
+> **Do NOT edit directly in ByteRover.** Treat the Memory Store as a *ReadOnly Cache* of the Git repository.
 
 ---
 
@@ -45,7 +44,7 @@ The Knowledge Base (KB) must reside in a version-controlled **Git Repository** (
 
 **File:** `FINANCE/AR/AR_SQL_STANDARDS.md`
 **Content:** `ALWAYS use NVL(EXCHANGE_RATE, 1)`
-**Metadata:** _Author:_ Sarah (Lead) | _Approver:_ Mike (Finance Lead)
+**Metadata:** *Author:* Sarah (Lead) | *Approver:* Mike (Finance Lead)
 
 ### B. In ByteRover (The Brain)
 
@@ -56,8 +55,8 @@ The Knowledge Base (KB) must reside in a version-controlled **Git Repository** (
 
 ## 4. Role-Based Access Control (RBAC)
 
-| Role                     | Description              | Access Level            |
-| ------------------------ | ------------------------ | ----------------------- |
+| Role                           | Description              | Access Level                  |
+| ------------------------------ | ------------------------ | ----------------------------- |
 | **Guardian / Architect** | Senior Leads             | **Write (Admin)**       |
 | **Module Lead**          | SME (e.g., Finance Lead) | **Write (Module Only)** |
 | **Developer**            | Report Developers        | **Read Only**           |
@@ -65,3 +64,5 @@ The Knowledge Base (KB) must reside in a version-controlled **Git Repository** (
 **Rule:** No merge to `main` is allowed unless approved by the Code Owner of that directory.
 
 this is a test txt
+
+this is test txt2
